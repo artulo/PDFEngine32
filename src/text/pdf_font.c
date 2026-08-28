@@ -981,6 +981,39 @@ int pdf_font_load(pdf_obj *font_dict, pdf_font *font,
              * proposito (fuera de alcance) y has_embedded_cff queda 0,
              * el llamador (pdf_render.c) cae a fuente de sistema. */
             font->has_embedded_cff = (pdf_cff_load(cff_bytes, cff_len, &font->embedded_cff) == PDF_OK);
+
+            /* BUG REAL ENCONTRADO (ver comentario grande junto a
+             * pdf_cff_glyph_width, pdf_cff.h): confirmado contra
+             * Agentes_de_inteligencia_artificial_y_workflows.pdf --
+             * /Widths de ESTE objeto de fuente en particular declara 0
+             * para varios codigos que SI se usan y SI tienen glyph real
+             * (un defecto de exportacion de Adobe InDesign, no de este
+             * parser). Con ancho 0 cada letra pisa a la siguiente
+             * (avance nulo) -- sintoma exacto reportado por Arturo. Un
+             * ancho declarado de 0 NUNCA gana contra el ancho real del
+             * programa embebido salvo que el glyph mismo tambien sea
+             * vacio (ancho 0 real, p.ej. una marca combinante o un
+             * espacio) -- 'pdf_cff_glyph_width' devuelve 0 igual en ese
+             * caso legitimo, asi que el 'if (w > 0.0)' de abajo no pisa
+             * nada quen SI era 0 a proposito. Solo se toca
+             * 'font->widths[c]' cuando /Widths declaro EXACTAMENTE 0
+             * (no -1.0 "sin dato", que ya cae a missing_width/500 en
+             * pdf_font_get_width y no tiene nada que ver con este bug). */
+            if (font->has_embedded_cff)
+            {
+                int c;
+                for (c = 0; c < 256; c++)
+                {
+                    int gid;
+                    double w;
+
+                    if (font->widths[c] != 0.0) continue;
+                    gid = pdf_cff_gid_for_code(&font->embedded_cff, c);
+                    if (gid <= 0) continue; /* 0 = .notdef, sin glyph real para este codigo */
+                    if (pdf_cff_glyph_width(&font->embedded_cff, gid, &w) == PDF_OK && w > 0.0)
+                        font->widths[c] = w;
+                }
+            }
         }
     }
 

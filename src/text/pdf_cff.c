@@ -227,7 +227,8 @@ static void cff_parse_top_dict(const unsigned char *d, long dlen, cff_top_dict *
  * cff_parse_top_dict (duplicado a proposito, en vez de generalizar con
  * una tabla de operadores de interes -- son solo 2 casos, no vale la
  * pena la indireccion). */
-static void cff_parse_private_dict(const unsigned char *d, long dlen, long *out_subrs_off, int *has_subrs)
+static void cff_parse_private_dict(const unsigned char *d, long dlen, long *out_subrs_off, int *has_subrs,
+                                    double *out_nominal_wx, double *out_default_wx)
 {
     long pos;
     double operands[CFF_MAX_DICT_OPERANDS];
@@ -235,6 +236,8 @@ static void cff_parse_private_dict(const unsigned char *d, long dlen, long *out_
 
     *out_subrs_off = 0;
     *has_subrs = 0;
+    *out_nominal_wx = 0.0;
+    *out_default_wx = 0.0;
     pos = 0;
     n_operands = 0;
 
@@ -256,6 +259,14 @@ static void cff_parse_private_dict(const unsigned char *d, long dlen, long *out_
             {
                 *out_subrs_off = (long)operands[n_operands - 1];
                 *has_subrs = 1;
+            }
+            else if (op == 20 && n_operands >= 1) /* defaultWidthX */
+            {
+                *out_default_wx = operands[n_operands - 1];
+            }
+            else if (op == 21 && n_operands >= 1) /* nominalWidthX */
+            {
+                *out_nominal_wx = operands[n_operands - 1];
             }
             n_operands = 0;
         }
@@ -622,7 +633,11 @@ int pdf_cff_load(const unsigned char *data, long len, pdf_cff_font *out)
     {
         long subrs_off_rel;
         int has_subrs;
-        cff_parse_private_dict(data + top.private_off, top.private_size, &subrs_off_rel, &has_subrs);
+        double nominal_wx, default_wx;
+        cff_parse_private_dict(data + top.private_off, top.private_size, &subrs_off_rel, &has_subrs,
+                                &nominal_wx, &default_wx);
+        out->nominal_width_x = nominal_wx;
+        out->default_width_x = default_wx;
         if (has_subrs)
         {
             cff_index lsubr_idx;
@@ -649,25 +664,61 @@ int pdf_cff_gid_for_code(const pdf_cff_font *font, int code)
     if (font == NULL || font->data == NULL) return 0;
     gid = -1;
     sid = -1;
-    if (!cff_encoding_lookup(font->data, font->data_len, font->encoding_off, code, &gid, &sid))
-        return 0;
-    if (gid >= 0) return gid;
-
-    /* Encoding solo dio un SID directo (via supplements), no un GID --
-     * hace falta la busqueda inversa en el Charset (GID->SID) para
-     * encontrar el GID cuyo SID coincide. O(numGlyphs), pero esta rama
-     * es rara en la practica (la mayoria de las fuentes reales no usa
-     * supplements de Encoding) y se ejecuta como mucho una vez por
-     * caracter, no por frame. */
+    if (cff_encoding_lookup(font->data, font->data_len, font->encoding_off, code, &gid, &sid))
     {
+        if (gid >= 0) return gid;
+
+        /* Encoding solo dio un SID directo (via supplements), no un GID
+         * -- hace falta la busqueda inversa en el Charset (GID->SID)
+         * para encontrar el GID cuyo SID coincide. O(numGlyphs), pero
+         * esta rama es rara en la practica (la mayoria de las fuentes
+         * reales no usa supplements de Encoding) y se ejecuta como
+         * mucho una vez por caracter, no por frame. */
+        if (sid >= 0)
+        {
+            int g;
+            for (g = 1; g < font->num_glyphs; g++)
+            {
+                long gsid;
+                if (cff_charset_lookup(font->data, font->data_len, font->charset_off, g, &gsid) && gsid == sid)
+                    return g;
+            }
+            return 0;
+        }
+    }
+
+    /* BUG REAL ENCONTRADO (ver DESIGN.md, ronda "fuentes con /Widths
+     * incompleto"): confirmado contra un subset real (BiomePro-SemiBold,
+     * en Agentes_de_inteligencia_artificial_y_workflows.pdf) cuyo
+     * Encoding EMBEBIDO en el propio CFF es practicamente vacio (una
+     * sola entrada, codigo 65='A') -- el subsetter confio enteramente en
+     * el /Encoding del diccionario de fuente del PDF (no en el Encoding
+     * interno del programa CFF) para decirle a un lector que glyph
+     * corresponde a cada codigo, algo perfectamente valido segun el
+     * estandar pero que deja a 'cff_encoding_lookup' sin ninguna
+     * entrada para casi todo el alfabeto. Para ASCII imprimible
+     * (32-126) hay una salida directa SIN tabla: el orden de los
+     * "Standard Strings" del CFF (T.5176.CFF Appendix A, SID 1-95) es
+     * IDENTICO al de StandardEncoding para ese mismo rango -- SID =
+     * code-31 (32->1="space" ... 126->95="asciitilde", verificado punto
+     * por punto contra el Appendix A). Vale para CUALQUIER fuente Latina
+     * convencional (los nombres de glyph de a-z/A-Z/digitos/puntuacion
+     * basica casi nunca son custom, aun en subsets fuertemente
+     * recortados) -- no depende del /Encoding del PDF ni de si esta
+     * fuente en particular declaro /Differences. Misma busqueda inversa
+     * por Charset que la rama de supplements de arriba. */
+    if (code >= 32 && code <= 126)
+    {
+        long std_sid = (long)code - 31;
         int g;
         for (g = 1; g < font->num_glyphs; g++)
         {
             long gsid;
-            if (cff_charset_lookup(font->data, font->data_len, font->charset_off, g, &gsid) && gsid == sid)
+            if (cff_charset_lookup(font->data, font->data_len, font->charset_off, g, &gsid) && gsid == std_sid)
                 return g;
         }
     }
+
     return 0;
 }
 
@@ -724,33 +775,50 @@ typedef struct cff_exec_s
     int    depth;
     int    done;
     int    had_error;
+
+    /* Captura del operando "extra" de ancho (ver comentario grande
+     * junto a pdf_cff_glyph_width, pdf_cff.h) -- 'has_width_delta' es
+     * 1 si el primer operador que limpio la pila tenia UN operando de
+     * mas (el delta de ancho respecto a nominalWidthX); si nunca hubo
+     * ese operando de mas, el ancho es defaultWidthX tal cual (ver
+     * pdf_cff_glyph_width). No afecta el dibujo del contorno -- mismo
+     * comportamiento de siempre para pdf_cff_glyph_outline, que ignora
+     * estos dos campos. */
+    int    has_width_delta;
+    double width_delta;
 } cff_exec;
 
 static void cff_emit_moveto(cff_exec *e, double x, double y)
 {
     e->x = x; e->y = y;
-    e->moveto(e->user, x * e->inv_upm, y * e->inv_upm);
+    if (e->moveto != NULL)
+        e->moveto(e->user, x * e->inv_upm, y * e->inv_upm);
 }
 
 static void cff_emit_lineto(cff_exec *e, double x, double y)
 {
     e->x = x; e->y = y;
-    e->lineto(e->user, x * e->inv_upm, y * e->inv_upm);
+    if (e->lineto != NULL)
+        e->lineto(e->user, x * e->inv_upm, y * e->inv_upm);
 }
 
 static void cff_emit_curveto(cff_exec *e, double x1, double y1, double x2, double y2, double x3, double y3)
 {
     e->x = x3; e->y = y3;
-    e->curveto(e->user, x1 * e->inv_upm, y1 * e->inv_upm, x2 * e->inv_upm, y2 * e->inv_upm,
-               x3 * e->inv_upm, y3 * e->inv_upm);
+    if (e->curveto != NULL)
+        e->curveto(e->user, x1 * e->inv_upm, y1 * e->inv_upm, x2 * e->inv_upm, y2 * e->inv_upm,
+                   x3 * e->inv_upm, y3 * e->inv_upm);
 }
 
 /* Descarta el operando inicial "extra" (el ancho del glyph, ver
- * Private DICT nominalWidthX/defaultWidthX -- NO nos interesa el
- * VALOR, este motor usa /Widths del PDF para el avance, ver
- * pdf_render.c) si esta presente. Solo aplica UNA vez por glyph, en el
- * primer operador que limpia la pila. 'expected' es la cantidad real
- * de operandos que esa operacion necesita. */
+ * Private DICT nominalWidthX/defaultWidthX) si esta presente, y lo
+ * CAPTURA en 'width_delta'/'has_width_delta' (ver comentario junto al
+ * struct, arriba) -- pdf_cff_glyph_outline no los usa (el avance de
+ * texto en este motor viene de /Widths del PDF, ver pdf_render.c), pero
+ * pdf_cff_glyph_width si, como fallback cuando ese /Widths esta roto
+ * (ver DESIGN.md). Solo aplica UNA vez por glyph, en el primer operador
+ * que limpia la pila. 'expected' es la cantidad real de operandos que
+ * esa operacion necesita. */
 static void cff_drop_width_if(cff_exec *e, int expected)
 {
     if (e->width_done) return;
@@ -758,6 +826,8 @@ static void cff_drop_width_if(cff_exec *e, int expected)
     if (e->nstack > expected)
     {
         int extra = e->nstack - expected, i;
+        e->has_width_delta = 1;
+        e->width_delta = e->stack[0];
         for (i = extra; i < e->nstack; i++) e->stack[i - extra] = e->stack[i];
         e->nstack -= extra;
     }
@@ -771,6 +841,8 @@ static void cff_stems(cff_exec *e)
         if ((e->nstack % 2) == 1)
         {
             int i;
+            e->has_width_delta = 1;
+            e->width_delta = e->stack[0];
             for (i = 1; i < e->nstack; i++) e->stack[i - 1] = e->stack[i];
             e->nstack--;
         }
@@ -1109,6 +1181,8 @@ static int cff_run(cff_exec *e, const unsigned char *code, long code_len)
                     if (e->nstack == 1 || e->nstack == 5)
                     {
                         int i;
+                        e->has_width_delta = 1;
+                        e->width_delta = e->stack[0];
                         for (i = 1; i < e->nstack; i++) e->stack[i - 1] = e->stack[i];
                         e->nstack--;
                     }
@@ -1156,5 +1230,33 @@ int pdf_cff_glyph_outline(const pdf_cff_font *font, int gid,
     if (!cff_run(&e, cs_ptr, cs_len))
         return PDF_ERR_BADARG;
 
+    return PDF_OK;
+}
+
+/* Ver comentario grande junto a la declaracion, pdf_cff.h. Corre el
+ * MISMO interprete que pdf_cff_glyph_outline, sin callbacks (moveto/
+ * lineto/curveto quedan NULL -- cff_emit_* ya los chequea antes de
+ * llamarlos, no dibuja nada), solo para llegar al primer operador que
+ * limpia la pila y capturar el operando de ancho si estaba presente. */
+int pdf_cff_glyph_width(const pdf_cff_font *font, int gid, double *out_width)
+{
+    cff_exec e;
+    const unsigned char *cs_ptr;
+    long cs_len;
+
+    if (font == NULL || out_width == NULL) return PDF_ERR_BADARG;
+    if (font->units_per_em <= 0.0) return PDF_ERR_BADARG;
+    if (gid < 0 || gid >= font->num_glyphs) return PDF_ERR_NOTFOUND;
+    if (!cff_get_charstring(font, gid, &cs_ptr, &cs_len)) return PDF_ERR_NOTFOUND;
+    if (cs_len <= 0) return PDF_ERR_NOTFOUND; /* glyph vacio (espacio): sin ancho propio */
+
+    memset(&e, 0, sizeof(e));
+    e.font = font;
+    e.inv_upm = 1.0 / font->units_per_em;
+
+    if (!cff_run(&e, cs_ptr, cs_len))
+        return PDF_ERR_BADARG;
+
+    *out_width = e.has_width_delta ? (font->nominal_width_x + e.width_delta) : font->default_width_x;
     return PDF_OK;
 }

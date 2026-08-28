@@ -121,6 +121,16 @@ RETURN nil
 #define PDFVIEWER_ZOOM_PERCENT_MAX   400
 #define PDFVIEWER_ZOOM_PERCENT_STEP  25
 
+// Cache de paginas ya renderizadas (Arturo: "sigue lento... al navegar"
+// -- con imagenes JPEG2000 pesadas de varias capas, DESIGN.md seccion
+// 75, cada pagina nueva cuesta segundos REALES de decodificar, y volver
+// a una pagina ya vista antes antes de este cache la volvia a decodificar
+// entera de nuevo). 6 entradas alcanza para el patron de uso mas comun
+// (ida y vuelta entre unas pocas paginas cercanas) sin acumular
+// demasiados HBITMAP -- son bitmaps a resolucion de PANTALLA (chicos),
+// no las imagenes JPX fuente, asi que el costo de memoria es bajo.
+#define PDFVIEW_PAGE_CACHE_SIZE 6
+
 // Vista continua (scroll entre paginas sin Siguiente/Anterior, Arturo:
 // "mostrar hojas continuas") -- gates de seguridad de BuildComposite()
 // (ver METHOD mas abajo, y el plan de esta fase: pdf_document_get_page
@@ -298,6 +308,7 @@ CLASS TPdfBitmap FROM TBitmap
    METHOD ClearSelection()
    METHOD SelectedText()                     // -> cString UTF-8 (puede ser "")
    METHOD CopySelection()                    // -> .T./.F. (via portapapeles)
+   METHOD HighlightSelection()               // -> .T./.F. (agrega /Highlight, ver DESIGN.md)
 
 ENDCLASS
 
@@ -480,7 +491,29 @@ METHOD MouseWheel( nKeys, nDelta, nXPos, nYPos ) CLASS TPdfBitmap
          return 0
       endif
       if nDelta < 0 .and. ::nX <= nMinX .and. ::oViewer:nCurPage < ::oViewer:nPageCount
-         ::oViewer:NextPage()                    // arranca en su PARTE DE ARRIBA (::nX=0, default de ApplyRender/GoToPage)
+         // BUG REAL ENCONTRADO Y ARREGLADO (Arturo: al pasar a la
+         // SIGUIENTE pagina saltaba pero se acomodaba al FINAL en vez
+         // de al principio -- solo pasaba yendo hacia adelante, hacia
+         // atras funcionaba bien). La rama de "pagina anterior" de
+         // arriba SIEMPRE fuerza ::nX a mano (comentario "arrancar en
+         // su PARTE DE ABAJO") -- esta rama en cambio asumia que
+         // ApplyRender/ScrollAdjust dejaban ::nX en 0 "por default" al
+         // renderizar la pagina nueva, pero ScrollAdjust() (bitmap.prg,
+         // TBitmap:ScrollAdjust()) SOLO resetea ::nX a 0 cuando la
+         // pagina entra COMPLETA en el area visible -- si la pagina
+         // (como en este caso, la razon de que este salto de pagina
+         // exista) necesita scroll vertical, PRESERVA el ::nX viejo en
+         // vez de resetearlo. Como el salto ocurre justo DESPUES de
+         // haber scrolleado hasta el fondo de la pagina anterior, ese
+         // ::nX viejo (bien negativo) se quedaba pegado en la pagina
+         // nueva -- mostrando su parte de ABAJO en vez de arriba. Fix:
+         // forzar ::nX a mano igual que la rama de arriba, en vez de
+         // confiar en un "default" que no existe en este caso.
+         ::oViewer:NextPage()
+         ::nX := 0
+         if ::oVScroll != nil .and. ::nVStep > 0
+            ::oVScroll:SetPos( 0 )
+         endif
          ::SyncCurPage()
          ::Refresh()
          return 0
@@ -919,6 +952,72 @@ METHOD CopySelection() CLASS TPdfBitmap
 return TClipBoard():New( , ::oWnd ):SetText( cText )
 
 //----------------------------------------------------------------------------//
+// Resaltado de texto (ver DESIGN.md, ronda "resaltado de texto") --
+// mismo molde que CopySelection() de arriba: toma ::aSelRanges TAL
+// CUAL esta (mismo formato de 7 columnas que ya resuelve
+// BuildSelRangesBetween/SelectedText), resuelve las filas sentinel
+// ("pagina completa", nEndIdx==-1 -- ver comentario junto a
+// DATA aSelRanges) a rectangulos REALES por linea (una anotacion de
+// resaltado necesita quads reales, no un rango de texto), agrupa por
+// pagina, y llama Pdf_AnnotAddHighlight() una vez por pagina tocada
+// por la seleccion. Pdf_AnnotAddHighlight espera los rects en el
+// MISMO formato topdown local que ya trae ::aSelRanges -- cero
+// conversion de coordenadas de este lado (la hace el binding C, que
+// tiene el /CropBox y el /Rotate nativo de la pagina a mano).
+//----------------------------------------------------------------------------//
+
+METHOD HighlightSelection() CLASS TPdfBitmap
+
+   local aRects := {}
+   local nPage := 0
+   local i, aRow, aSize, aFull, j
+   local lOk := .T.
+
+   if ::oViewer == nil .or. ::oViewer:pDoc == nil .or. Len( ::aSelRanges ) == 0
+      return .F.
+   endif
+
+   i := 1
+   while i <= Len( ::aSelRanges ) .and. lOk
+      nPage := ::aSelRanges[ i ][ 1 ]
+      aRects := {}
+
+      while i <= Len( ::aSelRanges ) .and. ::aSelRanges[ i ][ 1 ] == nPage
+         aRow := ::aSelRanges[ i ]
+         if aRow[ 3 ] == -1
+            // sentinel "pagina completa" -- resolver a los rects REALES
+            // de cada linea de esa pagina (extra_rotate=0: el mismo
+            // espacio nativo que usa Pdf_GlyphsBetweenPoints, NUNCA
+            // ::oViewer:PageSizePt() que puede venir intercambiado por
+            // ::nUserRotate, la rotacion de VISTA -- ver DESIGN.md).
+            aSize := Pdf_GetPageSizePt( ::oViewer:pDoc, nPage, 0 )
+            if aSize != nil
+               aFull := Pdf_GlyphsBetweenPoints( ::oViewer:pDoc, nPage, 0, 0, aSize[ 1 ], aSize[ 2 ] )
+               for j := 1 to Len( aFull )
+                  AAdd( aRects, { aFull[ j ][ 3 ], aFull[ j ][ 4 ], aFull[ j ][ 5 ], aFull[ j ][ 6 ] } )
+               next
+            endif
+         else
+            AAdd( aRects, { aRow[ 4 ], aRow[ 5 ], aRow[ 6 ], aRow[ 7 ] } )
+         endif
+         i++
+      enddo
+
+      if Len( aRects ) > 0
+         lOk := Pdf_AnnotAddHighlight( ::oViewer:pDoc, nPage, aRects )
+      endif
+   enddo
+
+   if !lOk
+      return .F.
+   endif
+
+   ::ClearSelection()
+   ::oViewer:RefreshRender()
+
+return .T.
+
+//----------------------------------------------------------------------------//
 // AcroForm: crea el TGet dinamico sobre el campo de texto 'aField' (fila
 // de Pdf_FormListFields), ubicado con PagePointToBmp -- MISMA formula
 // que ya usan Paint()/BmpToPagePoint, asi que queda alineado al
@@ -1044,6 +1143,32 @@ CLASS TPdfViewer
    DATA nPageWidthPt  INIT 0                     // tamanio de la pagina ACTUAL en puntos PDF (cache, ver comentario arriba)
    DATA nPageHeightPt INIT 0
 
+   // Ultimo render REAL (no el de "medir tamanio") hecho por
+   // RenderCurrentPage() -- BuildComposite() lo reusa para su propia
+   // pagina 1 si pagina/escala/rotacion coinciden, en vez de volver a
+   // renderizarla de cero (ver comentario grande en BuildComposite()).
+   DATA nLastRenderPage    INIT 0
+   DATA nLastRenderScale   INIT 0
+   DATA nLastRenderRotate  INIT 0
+   DATA nLastRenderW       INIT 0
+   DATA nLastRenderH       INIT 0
+   DATA nLastRenderSeconds INIT 0
+
+   // Cache de renders recientes (ver PDFVIEW_PAGE_CACHE_SIZE arriba) --
+   // fila = { nPage, nScale, nRotate, hBitmap, nW, nH }, mas vieja
+   // PRIMERO / mas reciente AL FINAL (LRU por posicion). Cada hBitmap
+   // cacheado es una COPIA independiente (DuplicateBitmap) de la que
+   // se muestra en pantalla -- nunca el mismo handle que ::hBitmap, asi
+   // que el swap-and-free normal de ApplyRender() nunca lo toca por
+   // accidente (y viceversa: liberar una entrada vieja del cache nunca
+   // le pisa el bitmap a lo que esta en pantalla ahora mismo).
+   DATA aPageCache INIT {}
+
+   METHOD FindPageCache( nPage, nScale, nRotate )  // -> fila del cache (promovida a mas-reciente) o NIL
+   METHOD PageCachePut( nPage, nScale, nRotate, hBitmap, nW, nH )
+   METHOD InvalidatePageCache( nPage )             // saca TODAS las entradas de 'nPage' (cualquier escala/rotacion) -- ver RefreshRender()
+   METHOD ClearPageCache()                         // libera TODOS los HBITMAP cacheados -- ver Close()
+
    DATA hBitmap       INIT 0                     // HBITMAP actualmente asignado a ::oBmp (para liberarlo antes de reemplazarlo)
 
    // vista continua (fase 3 del roadmap de potencialidad MuPDF, ver
@@ -1103,6 +1228,7 @@ CLASS TPdfViewer
    METHOD CopySelection()   INLINE if( ::oBmp != NIL, ::oBmp:CopySelection(), .F. )
    METHOD ClearSelection()  INLINE if( ::oBmp != NIL, ::oBmp:ClearSelection(), NIL )
    METHOD SelectedText()    INLINE if( ::oBmp != NIL, ::oBmp:SelectedText(), "" )
+   METHOD HighlightSelection() INLINE if( ::oBmp != NIL, ::oBmp:HighlightSelection(), .F. )
 
    // busqueda (Etapa 5): Find() arranca una busqueda nueva desde la pagina
    // actual; FindNext() avanza al siguiente match (dentro de la misma
@@ -1133,7 +1259,7 @@ CLASS TPdfViewer
    // ZoomIn/ZoomOut: RenderCurrentPage + BuildComposite, sirve para
    // ambos modos sin duplicar logica).
    METHOD HitTestField( nPage, x, y )
-   METHOD RefreshRender() INLINE ( ::RenderCurrentPage(), ::BuildComposite() )
+   METHOD RefreshRender() INLINE ( ::InvalidatePageCache( ::nCurPage ), ::RenderCurrentPage(), ::BuildComposite() )
 
    PROTECTED:
 
@@ -1230,11 +1356,14 @@ METHOD Close() CLASS TPdfViewer
       ::hBitmap := 0
    endif
 
+   ::ClearPageCache()      // los HBITMAP cacheados son de ESTE documento -- no tiene sentido conservarlos para el siguiente
+
    ::cFile         := NIL
    ::nPageCount    := 0
    ::nCurPage      := 0
    ::nPageWidthPt  := 0
    ::nPageHeightPt := 0
+   ::nLastRenderPage := 0  // invalidar tambien el cache de BuildComposite() -- ver comentario grande ahi
 
 return nil
 
@@ -1415,31 +1544,36 @@ return nil
 METHOD RenderCurrentPage() CLASS TPdfViewer
 
    local aRender
+   local aSizePt
+   local aCached
    local nScale
    local nNeedHeight
    local nNeedWidth
+   local tStart
 
    if ::pDoc == NIL .or. ::nCurPage < 1
       return .F.
    endif
 
-   // Si todavia no conocemos el tamanio de ESTA pagina en puntos PDF, y el
-   // modo de zoom no es 100% (que no lo necesita, usa escala fija 1.0), se
-   // hace un primer render a escala 1.0 SOLO para conocer el tamanio real de
-   // la pagina (ver comentario grande al principio del archivo) -- se
-   // aprovecha ese mismo render si el modo pedido resulta ser justamente
-   // 100%, para no renderizar dos veces.
+   // BUG REAL ENCONTRADO Y ARREGLADO (Arturo: "se cuelga" -- un PDF real
+   // con imagenes JPEG2000 pesadas de varias capas, ver DESIGN.md
+   // seccion 75, donde decodificarlas BIEN les hizo tomar el tiempo real
+   // que siempre debieron tomar en vez de fallar rapido y mal): esto
+   // ANTES hacia un render COMPLETO a escala 1.0 solo para conocer el
+   // tamanio de la pagina en puntos -- pagando el costo entero de
+   // decodificar TODAS las imagenes de la pagina nada mas que para leer
+   // dos numeros (¡y eso antes de siquiera hacer el render real que
+   // despues se ve en pantalla!). Pdf_GetPageSizePt (pdf_hbfunc.c) hace
+   // el MISMO calculo (CropBox/MediaBox/Rotate) sin decodificar ni
+   // rasterizar nada -- practicamente instantaneo sin importar que tan
+   // pesadas sean las imagenes de la pagina.
    if ( ::nPageWidthPt <= 0 .or. ::nPageHeightPt <= 0 )
-      aRender := Pdf_RenderToHBitmap( ::pDoc, ::nCurPage, 1.0, ::nUserRotate )
-      if aRender == NIL
+      aSizePt := Pdf_GetPageSizePt( ::pDoc, ::nCurPage, ::nUserRotate )
+      if aSizePt == NIL
          return .F.
       endif
-      ::nPageWidthPt  := aRender[ 2 ]
-      ::nPageHeightPt := aRender[ 3 ]
-
-      if ::nZoomMode == PDFVIEWER_ZOOM_100
-         return ::ApplyRender( aRender, 1.0 )
-      endif
+      ::nPageWidthPt  := aSizePt[ 1 ]
+      ::nPageHeightPt := aSizePt[ 2 ]
    endif
 
    do case
@@ -1471,10 +1605,46 @@ METHOD RenderCurrentPage() CLASS TPdfViewer
       nScale := 1.0
    endif
 
+   // Cache de paginas ya vistas (Arturo: "sigue lento... al navegar" --
+   // ver PDFVIEW_PAGE_CACHE_SIZE/DATA aPageCache arriba). Si ya
+   // renderizamos ESTA pagina a esta MISMA escala/rotacion antes (sin
+   // que el zoom/tamanio de ventana haya cambiado nScale desde
+   // entonces), no hace falta pagar de nuevo el costo de decodificar
+   // sus imagenes -- se duplica el bitmap cacheado (independiente del
+   // que ya esta en el cache, para no pisarlo) y se usa eso.
+   aCached := ::FindPageCache( ::nCurPage, nScale, ::nUserRotate )
+   if aCached != NIL
+      aRender := { DuplicateBitmap( aCached[ 4 ] ), aCached[ 5 ], aCached[ 6 ] }
+      if aRender[ 1 ] != NIL .and. aRender[ 1 ] != 0     // DuplicateBitmap pudo fallar (recursos GDI agotados, caso raro) -- si pasa, cae al render real de abajo en vez de mostrar un bitmap invalido
+         ::nLastRenderPage    := ::nCurPage
+         ::nLastRenderScale   := nScale
+         ::nLastRenderRotate  := ::nUserRotate
+         ::nLastRenderW       := aCached[ 5 ]
+         ::nLastRenderH       := aCached[ 6 ]
+         ::nLastRenderSeconds := 0.05    // ya cacheado -- practicamente instantaneo, no hay nada que proyectar en BuildComposite
+         return ::ApplyRender( aRender, nScale )
+      endif
+   endif
+
+   tStart  := Seconds()
    aRender := Pdf_RenderToHBitmap( ::pDoc, ::nCurPage, nScale, ::nUserRotate )
    if aRender == NIL
       return .F.
    endif
+
+   ::PageCachePut( ::nCurPage, nScale, ::nUserRotate, DuplicateBitmap( aRender[ 1 ] ), aRender[ 2 ], aRender[ 3 ] )
+
+   // BuildComposite() reusa ESTE render para su propia pagina 1 en vez
+   // de volver a renderizarla de cero (ver comentario grande ahi) --
+   // solo tiene sentido cuando coincide EXACTO pagina/escala/rotacion,
+   // asi que se guarda todo lo necesario para chequear esa igualdad
+   // despues.
+   ::nLastRenderPage    := ::nCurPage
+   ::nLastRenderScale   := nScale
+   ::nLastRenderRotate  := ::nUserRotate
+   ::nLastRenderW       := aRender[ 2 ]
+   ::nLastRenderH       := aRender[ 3 ]
+   ::nLastRenderSeconds := Seconds() - tStart
 
 return ::ApplyRender( aRender, nScale )
 
@@ -1498,6 +1668,91 @@ METHOD ApplyRender( aRender, nScale ) CLASS TPdfViewer
    endif
 
 return .T.
+
+//----------------------------------------------------------------------------//
+// Cache de paginas ya renderizadas -- ver DATA aPageCache / comentario
+// grande junto a PDFVIEW_PAGE_CACHE_SIZE. Las filas son
+// { nPage, nScale, nRotate, hBitmap, nW, nH }, mas vieja primero.
+//----------------------------------------------------------------------------//
+
+METHOD FindPageCache( nPage, nScale, nRotate ) CLASS TPdfViewer
+
+   local i, aRow
+
+   for i := 1 to Len( ::aPageCache )
+      aRow := ::aPageCache[ i ]
+      if aRow[ 1 ] == nPage .and. aRow[ 2 ] == nScale .and. aRow[ 3 ] == nRotate
+         // promover a "mas reciente" (mover al final) -- LRU real, no
+         // solo insercion-FIFO.
+         ADel( ::aPageCache, i )
+         ASize( ::aPageCache, Len( ::aPageCache ) - 1 )
+         AAdd( ::aPageCache, aRow )
+         return aRow
+      endif
+   next
+
+return NIL
+
+//----------------------------------------------------------------------------//
+
+METHOD PageCachePut( nPage, nScale, nRotate, hBitmap, nW, nH ) CLASS TPdfViewer
+
+   local aOld
+
+   if hBitmap == NIL .or. hBitmap == 0
+      return nil        // DuplicateBitmap fallo (recursos GDI agotados, caso raro) -- no cachear un handle invalido
+   endif
+
+   AAdd( ::aPageCache, { nPage, nScale, nRotate, hBitmap, nW, nH } )
+
+   if Len( ::aPageCache ) > PDFVIEW_PAGE_CACHE_SIZE
+      aOld := ::aPageCache[ 1 ]
+      ADel( ::aPageCache, 1 )
+      ASize( ::aPageCache, Len( ::aPageCache ) - 1 )
+      if aOld[ 4 ] != NIL .and. aOld[ 4 ] != 0
+         DeleteObject( aOld[ 4 ] )
+      endif
+   endif
+
+return nil
+
+//----------------------------------------------------------------------------//
+// Se llama ANTES de re-renderizar tras editar un campo de AcroForm (ver
+// RefreshRender() mas abajo) -- si no, una vuelta a esa pagina despues
+// de editarla serviria el bitmap VIEJO (previo a la edicion) desde el
+// cache, en vez del contenido real y actual.
+//----------------------------------------------------------------------------//
+
+METHOD InvalidatePageCache( nPage ) CLASS TPdfViewer
+
+   local i
+
+   for i := Len( ::aPageCache ) to 1 step -1
+      if ::aPageCache[ i ][ 1 ] == nPage
+         if ::aPageCache[ i ][ 4 ] != NIL .and. ::aPageCache[ i ][ 4 ] != 0
+            DeleteObject( ::aPageCache[ i ][ 4 ] )
+         endif
+         ADel( ::aPageCache, i )
+         ASize( ::aPageCache, Len( ::aPageCache ) - 1 )
+      endif
+   next
+
+return nil
+
+//----------------------------------------------------------------------------//
+
+METHOD ClearPageCache() CLASS TPdfViewer
+
+   local i
+
+   for i := 1 to Len( ::aPageCache )
+      if ::aPageCache[ i ][ 4 ] != NIL .and. ::aPageCache[ i ][ 4 ] != 0
+         DeleteObject( ::aPageCache[ i ][ 4 ] )
+      endif
+   next
+   ::aPageCache := {}
+
+return nil
 
 //----------------------------------------------------------------------------//
 // Vista continua (fase 3 del roadmap de potencialidad MuPDF, DESIGN.md
@@ -1536,6 +1791,7 @@ METHOD BuildComposite() CLASS TPdfViewer
    local oBrushGray
    local nYOff, nXOff
    local hOldComposite
+   local lReusedPage1 := .F.
 
    ::lContinuousMode := .F.
 
@@ -1552,15 +1808,36 @@ METHOD BuildComposite() CLASS TPdfViewer
       PdfViewLogDebug( "BuildComposite: GATE 1 (paginas) frena, " + hb_ntos( ::nPageCount ) + " > " + hb_ntos( PDFVIEW_CONTINUOUS_MAX_PAGES ) )
       return .F.
    endif
-   PdfViewLogDebug( "BuildComposite: gate 1 OK, llamando Pdf_RenderToHBitmap pagina 1..." )
-
-   tStart  := Seconds()
-   aRender := Pdf_RenderToHBitmap( ::pDoc, 1, ::nScale, ::nUserRotate )
-   if aRender == NIL
-      PdfViewLogDebug( "BuildComposite: Pdf_RenderToHBitmap(pagina 1) devolvio NIL" )
-      return .F.
+   // BUG REAL ENCONTRADO Y ARREGLADO (Arturo: "se cuelga" -- ver
+   // comentario grande en RenderCurrentPage()): Open() SIEMPRE llama
+   // GoToPage(1) (que ya renderiza la pagina 1 de verdad, a ::nScale)
+   // JUSTO ANTES de llamar aca -- si esta pasada de aca pide OTRA VEZ
+   // la MISMA pagina/escala/rotacion, es un render 100% redundante
+   // (mismos bytes de entrada, mismo resultado). Con imagenes JPEG2000
+   // pesadas de varias capas esto duplicaba minutos de espera por
+   // nada. Si ::nLastRenderPage/Scale/Rotate (poblados por
+   // RenderCurrentPage(), ver ahi) coinciden EXACTO, se reusa
+   // ::hBitmap (el bitmap de pagina 1 que YA esta en pantalla) en vez
+   // de pedir uno nuevo -- es seguro porque el swap-and-free normal de
+   // mas abajo (hOldComposite/DeleteObject) recien lo libera DESPUES
+   // de reemplazarlo por el compuesto, nunca antes.
+   if ::nLastRenderPage == 1 .and. ::nLastRenderScale == ::nScale .and. ;
+      ::nLastRenderRotate == ::nUserRotate .and. ;
+      ::hBitmap != NIL .and. ::hBitmap != 0
+      PdfViewLogDebug( "BuildComposite: reusando el render de pagina 1 de RenderCurrentPage() -- sin re-renderizar" )
+      aRender      := { ::hBitmap, ::nLastRenderW, ::nLastRenderH }
+      tPage1       := ::nLastRenderSeconds
+      lReusedPage1 := .T.
+   else
+      PdfViewLogDebug( "BuildComposite: gate 1 OK, llamando Pdf_RenderToHBitmap pagina 1..." )
+      tStart  := Seconds()
+      aRender := Pdf_RenderToHBitmap( ::pDoc, 1, ::nScale, ::nUserRotate )
+      if aRender == NIL
+         PdfViewLogDebug( "BuildComposite: Pdf_RenderToHBitmap(pagina 1) devolvio NIL" )
+         return .F.
+      endif
+      tPage1 := Seconds() - tStart
    endif
-   tPage1 := Seconds() - tStart
    if tPage1 <= 0
       tPage1 := 0.05           // Seconds() puede dar 0 en una pagina muy rapida -- no dividir/proyectar con 0
    endif
@@ -1574,7 +1851,7 @@ METHOD BuildComposite() CLASS TPdfViewer
    // este motor).
    if tPage1 * ::nPageCount > PDFVIEW_CONTINUOUS_MAX_SECONDS
       PdfViewLogDebug( "BuildComposite: GATE 2 (tiempo) frena, proyeccion=" + Str( tPage1 * ::nPageCount, 10, 3 ) + "s > " + Str( PDFVIEW_CONTINUOUS_MAX_SECONDS, 10, 3 ) + "s" )
-      DeleteObject( aRender[ 1 ] )
+      if ! lReusedPage1 ; DeleteObject( aRender[ 1 ] ) ; endif
       return .F.
    endif
 
@@ -1584,7 +1861,7 @@ METHOD BuildComposite() CLASS TPdfViewer
    nCompHeight := ::nPageCount * ( nPageH + PDFVIEW_PAGE_GAP_PX ) + PDFVIEW_PAGE_GAP_PX
    if nCompWidth > PDFVIEW_CONTINUOUS_MAX_DIM_PX .or. nCompHeight > PDFVIEW_CONTINUOUS_MAX_DIM_PX
       PdfViewLogDebug( "BuildComposite: GATE 3 (dimensiones) frena, " + hb_ntos( nCompWidth ) + "x" + hb_ntos( nCompHeight ) )
-      DeleteObject( aRender[ 1 ] )
+      if ! lReusedPage1 ; DeleteObject( aRender[ 1 ] ) ; endif
       return .F.
    endif
 
@@ -1592,7 +1869,7 @@ METHOD BuildComposite() CLASS TPdfViewer
    // tamanio de la primera (no se conoce el resto todavia).
    if ::nPageCount * nPageW * nPageH * 3 > PDFVIEW_CONTINUOUS_MAX_BYTES
       PdfViewLogDebug( "BuildComposite: GATE 4 (memoria) frena, " + hb_ntos( Int( ::nPageCount * nPageW * nPageH * 3 / ( 1024 * 1024 ) ) ) + "MB" )
-      DeleteObject( aRender[ 1 ] )
+      if ! lReusedPage1 ; DeleteObject( aRender[ 1 ] ) ; endif
       return .F.
    endif
 
@@ -1614,7 +1891,7 @@ METHOD BuildComposite() CLASS TPdfViewer
       PdfViewLogDebug( "BuildComposite: CreateCompatibleBitmap fallo (memoria GDI)" )
       DeleteDC( hDCMem )
       ReleaseDC( 0, hDCScreen )
-      DeleteObject( aRender[ 1 ] )
+      if ! lReusedPage1 ; DeleteObject( aRender[ 1 ] ) ; endif
       CursorArrow()
       return .F.
    endif
@@ -1652,7 +1929,14 @@ METHOD BuildComposite() CLASS TPdfViewer
          hBmpOldPage := SelectObject( hDCPage, aRender[ 1 ] )
          BitBlt( hDCMem, nXOff, nYOff, aRender[ 2 ], aRender[ 3 ], hDCPage, 0, 0, SRCCOPY )
          SelectObject( hDCPage, hBmpOldPage )
-         DeleteObject( aRender[ 1 ] )
+         // pagina 1 reusada (lReusedPage1): aRender[1] ES ::hBitmap, el
+         // bitmap que TODAVIA esta en pantalla en este momento -- no
+         // liberarlo aca. El swap-and-free normal de mas abajo
+         // (hOldComposite/DeleteObject, ya existente) lo libera solo
+         // DESPUES de reemplazarlo por el compuesto, nunca antes.
+         if nPage > 1 .or. ! lReusedPage1
+            DeleteObject( aRender[ 1 ] )
+         endif
 
          ::aPageWidthPx[ nPage ]  := aRender[ 2 ]
          ::aPageHeightPx[ nPage ] := aRender[ 3 ]

@@ -246,9 +246,20 @@ int pdf_page_get_content(pdf_stream *st, const pdf_xref_table *xref,
 
 /* --- resolucion recursiva de la N-esima pagina -------------------------- */
 
+/* 'node_ref_num' es el numero de objeto de la referencia /Kids[i] que
+ * llevo hasta ESTE 'node' (o -1 para el nodo raiz /Pages, que no llega
+ * via ninguna entrada de /Kids sino de /Root/Pages directo) -- se
+ * actualiza en cada nivel de la recursion antes de bajar, asi que
+ * cuando el nodo hoja (la pagina buscada) hace match, 'node_ref_num'
+ * es exactamente SU propio numero de objeto real (ver
+ * pdf_document_get_page_ex, agregado en la fase de resaltado de texto
+ * para poder marcar una pagina como "tocada" al escribir /Annots
+ * nuevo -- un PDF_DICT, a diferencia de PDF_STREAM, no guarda su
+ * propio obj_num/obj_gen en el struct pdf_obj). */
 static pdf_obj *pdf_walk_page_tree(pdf_stream *st, const pdf_xref_table *xref,
                                     pdf_arena *arena, pdf_obj *node,
-                                    int *counter, int target)
+                                    int *counter, int target,
+                                    long node_ref_num, long *out_num)
 {
     pdf_obj *kids = pdf_dict_get(node, "Kids");
 
@@ -260,7 +271,10 @@ static pdf_obj *pdf_walk_page_tree(pdf_stream *st, const pdf_xref_table *xref,
          * "Page" explicitamente o falta (tolerante, como el resto del
          * parser). */
         if (*counter == target)
+        {
+            if (out_num != NULL) *out_num = node_ref_num;
             return node;
+        }
         (*counter)++;
         return NULL;
     }
@@ -280,7 +294,8 @@ static pdf_obj *pdf_walk_page_tree(pdf_stream *st, const pdf_xref_table *xref,
             if (child == NULL)
                 continue;
 
-            found = pdf_walk_page_tree(st, xref, arena, child, counter, target);
+            found = pdf_walk_page_tree(st, xref, arena, child, counter, target,
+                                        ref->u.ref.num, out_num);
             if (found != NULL)
                 return found;
         }
@@ -289,11 +304,14 @@ static pdf_obj *pdf_walk_page_tree(pdf_stream *st, const pdf_xref_table *xref,
     return NULL;
 }
 
-pdf_obj *pdf_document_get_page(pdf_stream *st, const pdf_xref_table *xref,
-                                pdf_arena *arena, int page_index)
+pdf_obj *pdf_document_get_page_ex(pdf_stream *st, const pdf_xref_table *xref,
+                                   pdf_arena *arena, int page_index,
+                                   long *out_obj_num)
 {
     pdf_obj *pages;
     int counter;
+
+    if (out_obj_num != NULL) *out_obj_num = -1;
 
     if (st == NULL || xref == NULL || arena == NULL || page_index < 0)
         return NULL;
@@ -303,7 +321,13 @@ pdf_obj *pdf_document_get_page(pdf_stream *st, const pdf_xref_table *xref,
         return NULL;
 
     counter = 0;
-    return pdf_walk_page_tree(st, xref, arena, pages, &counter, page_index);
+    return pdf_walk_page_tree(st, xref, arena, pages, &counter, page_index, -1, out_obj_num);
+}
+
+pdf_obj *pdf_document_get_page(pdf_stream *st, const pdf_xref_table *xref,
+                                pdf_arena *arena, int page_index)
+{
+    return pdf_document_get_page_ex(st, xref, arena, page_index, NULL);
 }
 
 

@@ -27,12 +27,12 @@ function Main()
    // importar el SIZE en pixels del control. Tiene que venir pre-rellenado
    // con Space().
    local cFindText := Space( 60 )
-   local cPdf := "..\tests\1905.07689.pdf"   // TEMPORAL: probando seleccion/busqueda multi-pagina -- ver DESIGN.md 70.1
+   local cPdf := "..\tests\enciclopedia de soldadura.pdf"   // TEMPORAL: probando seleccion/busqueda multi-pagina -- ver DESIGN.md 70.1
 
    PdfViewLogReset()   // diagnostico TEMPORAL de BuildComposite(), ver pdf_viewer.prg
 
    DEFINE WINDOW oWnd TITLE "PDFEngine32 - " + cPdf ;
-      FROM 0, 0 TO 700, 950 PIXEL
+      FROM 0, 0 TO 700, 1000 PIXEL
 		
 		DEFINE BUTTONBAR oBar OF oWnd SIZE 45, 24 3D 2007
 		
@@ -114,6 +114,17 @@ function Main()
 			 PROMPT "Rotar" ;
 			 ACTION ( oPdf:RotatePage(), oSayPage:Refresh() )
 
+		// Resaltado de texto (Arturo: "colocar anotaciones de resaltado de
+		// textos", ver DESIGN.md) -- toma la seleccion de texto vigente
+		// (::aSelRanges, arrastre de mouse) y agrega una anotacion real
+		// /Highlight a la pagina (amarillo, 40% Multiply -- sin selector de
+		// color en esta version). Igual que AcroForm: solo muta el
+		// documento EN MEMORIA, el boton "Guardar" (arriba) persiste al
+		// archivo.
+		DEFINE BUTTON OF oBar ;
+			 PROMPT "Resaltar" ;
+			 ACTION ( oPdf:HighlightSelection(), oSayPage:Refresh() )
+
 
       oPdf := TPdfViewer():New( oWnd, ALTO_TOOLBAR, 0, ;
                                  oWnd:nWidth, oWnd:nHeight - ALTO_TOOLBAR )
@@ -124,12 +135,13 @@ function Main()
       // (saltando nClrText/nClrBack) para que 110/20 caigan en nWidth/
       // nHeight y no en nClrText/nClrBack.
       //
-      // 15 botones ahora (<< < > >> Ajustar 100% Ancho - + Copiar Buscar
-      // Sigue Guardar Imprimir Rotar -- 45px cada uno, ver DEFINE BUTTON
-      // arriba), la barra ocupa 15*45=675px -- se corre todo lo que va
-      // DESPUES de ella para no solaparse (la ventana se agrando a 950px
-      // de ancho, "FROM 0,0 TO 700,950 PIXEL", para que entre con margen).
-      oSayPage := TSay():New( 5, 685, ;
+      // 16 botones ahora (<< < > >> Ajustar 100% Ancho - + Copiar Buscar
+      // Sigue Guardar Imprimir Rotar Resaltar -- 45px cada uno, ver
+      // DEFINE BUTTON arriba), la barra ocupa 16*45=720px -- se corre todo
+      // lo que va DESPUES de ella para no solaparse (la ventana se agrando
+      // a 1000px de ancho, "FROM 0,0 TO 700,1000 PIXEL", para que entre
+      // con margen).
+      oSayPage := TSay():New( 5, 730, ;
          {|| "" + hb_ntos( oPdf:nCurPage ) + " / " + hb_ntos( oPdf:nPageCount ) }, ;
          oWnd, , , , .F., .F., .T., , , 60, 15 )
 
@@ -140,7 +152,7 @@ function Main()
       // MULTILINEA/memo, no para un cuadro de busqueda de una linea) --
       // sumado al bug de Space() de arriba, entre las dos cosas el GET no
       // aceptaba texto en absoluto.
-      @ 5, 755 GET oGetFind VAR cFindText PICTURE "@S30" SIZE 150, 20 OF oWnd PIXEL
+      @ 5, 800 GET oGetFind VAR cFindText PICTURE "@S30" SIZE 150, 20 OF oWnd PIXEL
 
    ACTIVATE WINDOW oWnd ;
       ON INIT ( IIF( oPdf:Open( cPdf ) , oSayPage:Refresh(), ;

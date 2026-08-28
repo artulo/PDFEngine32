@@ -33,6 +33,39 @@
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>   /* PDF_JPX_TIMING -- diagnostico TEMPORAL de rendimiento, ver DESIGN.md */
+
+/* BUG REAL DE RENDIMIENTO ENCONTRADO Y ARREGLADO (Arturo: "sigue lento"
+ * al abrir por primera vez una pagina con imagenes JPX pesadas de
+ * varias capas -- ver DESIGN.md seccion 75 y el fix en cb_pass_cleanup
+ * mas abajo, que solo, ya duplico la velocidad). getenv("PDF_JPX_DEBUG")
+ * y getenv("PDF_JPX_ONLY_V0") se llamaban SIN CACHEAR en un par de
+ * lugares realmente calientes: cb_decode_sign() (una vez por CADA
+ * coeficiente que se vuelve significativo -- pueden ser millones en
+ * una imagen real) y el armado final del buffer RGB (una vez POR
+ * PIXEL de la imagen completa). Como estas banderas de entorno son de
+ * DEBUG -- nunca cambian durante la corrida del proceso -- alcanza con
+ * consultarlas UNA sola vez por nombre y cachear el resultado; todas
+ * las llamadas siguientes devuelven el valor cacheado sin tocar el
+ * entorno de nuevo. */
+static int jpx_env_flag_cached(const char *name, int *cache)
+{
+    if (*cache < 0)
+        *cache = (getenv(name) != NULL) ? 1 : 0;
+    return *cache;
+}
+
+static int jpx_debug_on(void)
+{
+    static int cache = -1;
+    return jpx_env_flag_cached("PDF_JPX_DEBUG", &cache);
+}
+
+static int jpx_only_v0_on(void)
+{
+    static int cache = -1;
+    return jpx_env_flag_cached("PDF_JPX_ONLY_V0", &cache);
+}
 
 /* ====================================================================
  * 1. Decodificador aritmetico MQ (T.800 Annex C / identico al de
@@ -427,9 +460,33 @@ typedef struct
     unsigned int  *mag;      /* magnitud acumulada (bits de a uno, de MSB a LSB) */
     band_type band;
     mq_ctx ctx[NUM_CTX];
+
+    /* BUG REAL ENCONTRADO Y ARREGLADO (Arturo probo un PDF real con
+     * imagenes JPX de 5 capas de calidad -- "checkerboard" de bloques
+     * de colores en vez del icono real): las capas de un code-block NO
+     * son streams MQ independientes, son UN SOLO stream continuo
+     * cortado por limites de PASADA -- decodificar cada capa por
+     * separado (como hacia esta funcion antes, con mq_init() arrancando
+     * de cero en cada llamada) interpreta los bytes de la capa 2+ como
+     * si fueran el INICIO de un stream nuevo, produciendo basura. Fix:
+     * en vez de decodificar apenas llega cada capa, se ACUMULAN los
+     * rangos (offset,largo) dentro de tile_data de cada capa que le
+     * aporto algo a este code-block (range_off/range_len, hasta
+     * max_ranges = cod->num_layers -- un code-block aparece como mucho
+     * una vez por capa) y se decodifica UNA SOLA VEZ al final, con
+     * todos los bytes concatenados en orden y el total_passes YA
+     * final -- ver el segundo bucle nuevo despues del recorrido de
+     * paquetes en jpx_decode_tile_data(). Para el caso de 1 sola capa
+     * (el unico soportado antes de este fix) esto es matematicamente
+     * identico a lo de antes, solo reordenado -- por eso no hace falta
+     * un camino separado para ese caso. */
+    long *range_off;
+    int  *range_len;
+    int   n_ranges;
+    int   max_ranges;
 } cb_state;
 
-static cb_state *cb_state_create(pdf_arena *arena, int w, int h, band_type band)
+static cb_state *cb_state_create(pdf_arena *arena, int w, int h, band_type band, int num_layers)
 {
     cb_state *s;
     int stride, total, i;
@@ -457,6 +514,14 @@ static cb_state *cb_state_create(pdf_arena *arena, int w, int h, band_type band)
     memset(s->mag, 0, sizeof(unsigned int) * (size_t)total);
 
     for (i = 0; i < NUM_CTX; i++) { s->ctx[i].i = 0; s->ctx[i].mps = 0; }
+
+    if (num_layers < 1) num_layers = 1;
+    s->n_ranges   = 0;
+    s->max_ranges = num_layers;
+    s->range_off  = (long *)pdf_arena_alloc(arena, sizeof(long) * (size_t)num_layers);
+    s->range_len  = (int  *)pdf_arena_alloc(arena, sizeof(int)  * (size_t)num_layers);
+    if (s->range_off == NULL || s->range_len == NULL)
+        return NULL;
     /* BUG REAL ENCONTRADO Y CONFIRMADO (T.800 Tabla D.7 / verificado
      * ademas linea por linea contra el codigo fuente real de OpenJPEG
      * 2.5.4, funcion opj_mqc_reset_enc en mqc.c y su contraparte de
@@ -557,7 +622,7 @@ static int cb_decode_sign(cb_state *s, mq_dec *mq, int x, int y)
     ctxi = cb_sign_context(s, x, y, &xorbit); /* ya es indice ABSOLUTO (9-13) dentro de s->ctx */
     bit = mq_decode(mq, &s->ctx[ctxi]);
     sign = bit ^ xorbit;
-    if (getenv("PDF_JPX_DEBUG"))
+    if (jpx_debug_on())
         fprintf(stderr, "DEBUG signo (%d,%d): ctxi=%d xorbit=%d bit_crudo=%d -> sign_final=%d\n",
                 x, y, ctxi, xorbit, bit, sign);
     s->sign[CB_IDX(s, x, y)] = (unsigned char)sign;
@@ -656,6 +721,20 @@ static void cb_pass_mrp(cb_state *s, mq_dec *mq, int bitplane)
 static void cb_pass_cleanup(cb_state *s, mq_dec *mq, int bitplane)
 {
     int y0;
+    /* BUG REAL DE RENDIMIENTO ENCONTRADO Y ARREGLADO (Arturo: "sigue
+     * lento" al abrir la primera vez -- perfilado con PDF_JPX_TIMING
+     * mostro que Tier-1 (esta funcion + cb_pass_spp/mrp) es ~92% del
+     * tiempo total de decodificar una imagen JPX real): getenv() se
+     * llamaba adentro del loop MAS interno (una vez por cada franja de
+     * 4 filas x columna, osea (alto/4)*ancho veces POR BITPLANO POR
+     * CODE-BLOCK -- para una imagen con miles de code-blocks y varios
+     * bitplanos cada uno, esto suma millones de llamadas a getenv(),
+     * que hace un escaneo lineal de variables de entorno cada vez, por
+     * una bandera de DEBUG que en el uso normal jamas esta seteada.
+     * Sacado del loop -- se consulta UNA sola vez por llamada a esta
+     * funcion (una vez por bitplano por code-block, no una vez por
+     * coeficiente) sin cambiar el comportamiento en absoluto. */
+    int no_rl = (getenv("PDF_JPX_NO_RL") != NULL);
     for (y0 = 0; y0 < s->h; y0 += 4)
     {
         int rows = (s->h - y0 < 4) ? s->h - y0 : 4;
@@ -673,7 +752,7 @@ static void cb_pass_cleanup(cb_state *s, mq_dec *mq, int bitplane)
              * para decir de un saque "ninguno de los 4 se activa" (un
              * solo bit=0) o "el primero en activarse es el indice
              * tal" (bit=1 + 2 bits de indice, contexto UNIFORM). */
-            if (rows == 4 && getenv("PDF_JPX_NO_RL") == NULL)
+            if (rows == 4 && !no_rl)
             {
                 int all_virgin = 1, k;
                 for (k = 0; k < 4; k++)
@@ -1516,7 +1595,7 @@ static double *jpx_component_synth(pdf_arena *arena, jpx_tile_comp *tc,
         }
     }
 
-    if (getenv("PDF_JPX_DEBUG"))
+    if (jpx_debug_on())
     {
         cb_state *cbst = tc->ll0->cb[0];
         fprintf(stderr, "DEBUG LL0: ext=(%d,%d)-(%d,%d) w=%d h=%d step=%.6f ncbx=%d ncby=%d\n",
@@ -1619,6 +1698,124 @@ static double *jpx_component_synth(pdf_arena *arena, jpx_tile_comp *tc,
 
 /* --- decodificacion de un tile completo --------------------------------- */
 
+/* Decodifica los code-blocks de UNA subbanda que ya juntaron todos sus
+ * rangos de bytes (ver comentario grande en cb_state) -- se llama
+ * DESPUES de terminar el recorrido completo de paquetes (todas las
+ * capas), nunca durante. Copia los rangos (potencialmente salteados
+ * dentro de tile_data, uno por capa que le aporto algo a ese
+ * code-block) a un buffer chico contiguo en la arena y recien ahi
+ * llama cb_decode() -- UNA sola vez por code-block, con el
+ * total_passes YA final. */
+static int jpx_decode_pending_subband(pdf_arena *arena, jpx_subband *sb,
+                                       const unsigned char *tile_data)
+{
+    int idx, n;
+
+    if (sb == NULL) return PDF_OK;
+
+    n = sb->ncbx * sb->ncby;
+    for (idx = 0; idx < n; idx++)
+    {
+        cb_state *cbs = sb->cb[idx];
+        unsigned char *buf;
+        int total_len, r, off;
+        int msb_bp;
+
+        if (cbs == NULL || cbs->n_ranges == 0) continue;
+
+        total_len = 0;
+        for (r = 0; r < cbs->n_ranges; r++) total_len += cbs->range_len[r];
+        if (total_len <= 0) continue;
+
+        buf = (unsigned char *)pdf_arena_alloc(arena, (size_t)total_len);
+        if (buf == NULL) return PDF_ERR_NOMEM;
+
+        off = 0;
+        for (r = 0; r < cbs->n_ranges; r++)
+        {
+            memcpy(buf + off, tile_data + cbs->range_off[r], (size_t)cbs->range_len[r]);
+            off += cbs->range_len[r];
+        }
+
+        msb_bp = sb->mb - 1 - sb->zero_planes[idx];
+        if (jpx_debug_on())
+            fprintf(stderr, "DEBUG cb_decode(final) idx=%d n_ranges=%d total_len=%d total_passes=%d msb_bp=%d\n",
+                    idx, cbs->n_ranges, total_len, sb->total_passes[idx], msb_bp);
+        cb_decode(cbs, buf, total_len, sb->total_passes[idx], msb_bp);
+    }
+    return PDF_OK;
+}
+
+/* Procesa UN paquete (una combinacion (layer,res,comp) puntual) --
+ * extraido tal cual de jpx_decode_tile (sin cambios de logica) para
+ * poder llamarlo con el orden de bucles que corresponda segun
+ * cod->prog_order (LRCP vs RLCP, ver comentario grande en el
+ * llamador). Avanza 'br' in-place. */
+static void jpx_process_one_packet(pdf_arena *arena, bitrd *br, jpx_tile_comp *tc,
+                                    const cod_params *cod, long tile_len,
+                                    int layer, int res, int comp)
+{
+    jpx_subband *bands[3];
+    int nbands;
+    int cbband[256], cbidx[256], cblen[256];
+    int n, k;
+
+    if (res == 0) { bands[0] = tc[comp].ll0; nbands = 1; }
+    else { bands[0] = tc[comp].hl[res]; bands[1] = tc[comp].lh[res]; bands[2] = tc[comp].hh[res]; nbands = 3; }
+
+    n = jpx_packet_header(br, bands, nbands, layer, cbband, cbidx, cblen, 256);
+    bitrd_align(br);
+    if (jpx_debug_on())
+        fprintf(stderr, "DEBUG paquete layer=%d res=%d comp=%d nbands=%d n_incluidos=%d bytepos=%ld\n",
+                layer, res, comp, nbands, n, br->bytepos);
+
+    for (k = 0; k < n; k++)
+    {
+        jpx_subband *sb = bands[cbband[k]];
+        int idx = cbidx[k];
+        long avail = tile_len - br->bytepos;
+        long take = cblen[k];
+        if (take > avail) take = avail; /* defensivo: datos truncados */
+        if (jpx_debug_on())
+            fprintf(stderr, "  cb band=%d idx=%d len=%d zero_planes=%d total_passes=%d mb=%d\n",
+                    cbband[k], idx, cblen[k], sb->zero_planes[idx], sb->total_passes[idx], sb->mb);
+        if (take > 0)
+        {
+            /* los bytes del cuerpo se agregan directo al
+             * code-block (creandolo si es la primera vez) */
+            if (sb->cb[idx] == NULL)
+            {
+                int bx = (idx % sb->ncbx) * cod->cb_w;
+                int by = (idx / sb->ncbx) * cod->cb_h;
+                int bw = rect_w(sb->ext) - bx;
+                int bh = rect_h(sb->ext) - by;
+                if (bw > cod->cb_w) bw = cod->cb_w;
+                if (bh > cod->cb_h) bh = cod->cb_h;
+                if (bw > 0 && bh > 0)
+                    sb->cb[idx] = cb_state_create(arena, bw, bh, sb->band, cod->num_layers);
+            }
+            /* NO se decodifica aca -- ver comentario grande en cb_state
+             * (mas arriba): las capas de un code-block son UN SOLO
+             * stream MQ continuo, asi que solo se puede decodificar
+             * bien cuando ya se juntaron TODOS los bytes de TODAS las
+             * capas que le tocaron. Por ahora solo se registra donde
+             * estan estos bytes dentro de tile_data -- el decode real
+             * pasa en jpx_decode_pending_subband(), una vez terminado
+             * TODO el recorrido de paquetes. */
+            if (sb->cb[idx] != NULL && sb->cb[idx]->n_ranges < sb->cb[idx]->max_ranges)
+            {
+                cb_state *cbs = sb->cb[idx];
+                cbs->range_off[cbs->n_ranges] = br->bytepos;
+                cbs->range_len[cbs->n_ranges] = (int)take;
+                cbs->n_ranges++;
+            }
+        }
+        br->bytepos += take;
+        br->bitpos = 7;
+        br->prev_was_ff = 0;
+    }
+}
+
 /* Decodifica todos los paquetes de un tile (los datos entre SOD y el
  * proximo SOT/EOC) siguiendo el orden de progresion indicado, y
  * dispara Tier-1 + sintesis para cada componente. 'comp_planes' (ya
@@ -1663,101 +1860,84 @@ static int jpx_decode_tile(pdf_arena *arena, const unsigned char *tile_data, lon
         }
     }
 
-    /* --- recorrer paquetes segun el orden de progresion ------------- */
+    /* --- recorrer paquetes segun el orden de progresion -------------
+     * BUG REAL ENCONTRADO Y ARREGLADO (mismo PDF de 5 capas de arriba):
+     * el recorrido estaba SIEMPRE codificado como layer-afuera,
+     * resolucion-en-medio, componente-adentro (orden LRCP) sin importar
+     * lo que dijera cod->prog_order -- con 1 sola capa da lo mismo
+     * (intercambiar dos bucles cuando uno mide 1 no cambia nada, por
+     * eso el caso de 1 capa SIEMPRE funciono bien), pero con RLCP
+     * (prog_order==1, el caso real de este archivo) el orden real de
+     * los paquetes en el archivo es resolucion-afuera, capa-en-medio,
+     * componente-adentro -- leerlos como si fueran LRCP le asigna los
+     * bytes de cada paquete a la combinacion (layer,res,comp)
+     * EQUIVOCADA. jpx_process_one_packet() -- el cuerpo de "procesar
+     * UN paquete", sin cambios de logica, solo movido a funcion aparte
+     * -- ahora se llama con el orden de bucles que corresponda. */
     bitrd_init(&br, tile_data, tile_len);
 
     {
+        clock_t t_packets0, t_packets1, t_tier1_1;
+        t_packets0 = clock();
+
+    if (cod->prog_order == 0) /* LRCP */
+    {
         int layer, res, comp;
         for (layer = 0; layer < cod->num_layers; layer++)
-        {
             for (res = 0; res < tc[0].geom.nres; res++)
-            {
                 for (comp = 0; comp < siz->ncomp; comp++)
-                {
-                    jpx_subband *bands[3];
-                    int nbands;
-                    int cbband[256], cbidx[256], cblen[256];
-                    int n, k;
+                    jpx_process_one_packet(arena, &br, tc, cod, tile_len, layer, res, comp);
+    }
+    else /* RLCP (prog_order == 1, el unico otro caso aceptado arriba) */
+    {
+        int layer, res, comp;
+        for (res = 0; res < tc[0].geom.nres; res++)
+            for (layer = 0; layer < cod->num_layers; layer++)
+                for (comp = 0; comp < siz->ncomp; comp++)
+                    jpx_process_one_packet(arena, &br, tc, cod, tile_len, layer, res, comp);
+    }
+    t_packets1 = clock();
 
-                    if (cod->prog_order == 0 && layer > 0 && res == 0 && comp == 0)
-                    { /* LRCP: nada especial, el orden de los for ya es L,R,C -- placeholder para claridad */ }
-
-                    if (res == 0) { bands[0] = tc[comp].ll0; nbands = 1; }
-                    else { bands[0] = tc[comp].hl[res]; bands[1] = tc[comp].lh[res]; bands[2] = tc[comp].hh[res]; nbands = 3; }
-
-                    n = jpx_packet_header(&br, bands, nbands, layer, cbband, cbidx, cblen, 256);
-                    bitrd_align(&br);
-                    if (getenv("PDF_JPX_DEBUG"))
-                        fprintf(stderr, "DEBUG paquete layer=%d res=%d comp=%d nbands=%d n_incluidos=%d bytepos=%ld\n",
-                                layer, res, comp, nbands, n, br.bytepos);
-
-                    for (k = 0; k < n; k++)
-                    {
-                        jpx_subband *sb = bands[cbband[k]];
-                        int idx = cbidx[k];
-                        long avail = tile_len - br.bytepos;
-                        long take = cblen[k];
-                        if (take > avail) take = avail; /* defensivo: datos truncados */
-                        if (getenv("PDF_JPX_DEBUG"))
-                            fprintf(stderr, "  cb band=%d idx=%d len=%d zero_planes=%d total_passes=%d mb=%d\n",
-                                    cbband[k], idx, cblen[k], sb->zero_planes[idx], sb->total_passes[idx], sb->mb);
-                        if (take > 0)
-                        {
-                            /* los bytes del cuerpo se agregan directo al
-                             * code-block (creandolo si es la primera vez) */
-                            if (sb->cb[idx] == NULL)
-                            {
-                                int bx = (idx % sb->ncbx) * cod->cb_w;
-                                int by = (idx / sb->ncbx) * cod->cb_h;
-                                int bw = rect_w(sb->ext) - bx;
-                                int bh = rect_h(sb->ext) - by;
-                                if (bw > cod->cb_w) bw = cod->cb_w;
-                                if (bh > cod->cb_h) bh = cod->cb_h;
-                                if (bw > 0 && bh > 0)
-                                    sb->cb[idx] = cb_state_create(arena, bw, bh, sb->band);
-                            }
-                            /* BUG evitado: cb_decode necesita TODOS los
-                             * bytes de una sola vez (arranca su propio
-                             * MQ-decoder desde el principio) -- como en
-                             * nuestro caso real hay 1 sola capa, cada
-                             * code-block recibe sus datos en UNA sola
-                             * pasada por aca, asi que alcanza con
-                             * decodificar directo sin buffer intermedio
-                             * acumulable entre capas (ver limitaciones,
-                             * mas de 1 capa por code-block NO se
-                             * re-decodifica incrementalmente). */
-                            if (sb->cb[idx] != NULL)
-                            {
-                                int msb_bp = sb->mb - 1 - sb->zero_planes[idx];
-                                if (getenv("PDF_JPX_DEBUG"))
-                                {
-                                    long dbi;
-                                    fprintf(stderr, "DEBUG cb_decode band=%d idx=%d msb_bp=%d take=%ld bytes=[",
-                                            cbband[k], idx, msb_bp, take);
-                                    for (dbi = 0; dbi < take; dbi++)
-                                        fprintf(stderr, "%02X ", tile_data[br.bytepos + dbi]);
-                                    fprintf(stderr, "]\n");
-                                }
-                                cb_decode(sb->cb[idx], tile_data + br.bytepos, take,
-                                          sb->total_passes[idx], msb_bp);
-                            }
-                        }
-                        br.bytepos += take;
-                        br.bitpos = 7;
-                        br.prev_was_ff = 0;
-                    }
-                }
-            }
+    /* --- decodificar (Tier-1) los code-blocks que quedaron pendientes,
+     * ahora que ya se junto TODO lo de TODAS las capas -- ver comentario
+     * grande en cb_state/jpx_decode_pending_subband. Tiene que pasar
+     * ANTES de la sintesis de abajo (que lee sb->cb[idx] ya decodificado
+     * via jpx_component_synth). */
+    for (c = 0; c < siz->ncomp; c++)
+    {
+        int r2;
+        int rc = jpx_decode_pending_subband(arena, tc[c].ll0, tile_data);
+        if (rc != PDF_OK) return rc;
+        for (r2 = 1; r2 < tc[c].geom.nres; r2++)
+        {
+            rc = jpx_decode_pending_subband(arena, tc[c].hl[r2], tile_data);
+            if (rc != PDF_OK) return rc;
+            rc = jpx_decode_pending_subband(arena, tc[c].lh[r2], tile_data);
+            if (rc != PDF_OK) return rc;
+            rc = jpx_decode_pending_subband(arena, tc[c].hh[r2], tile_data);
+            if (rc != PDF_OK) return rc;
         }
+    }
+    t_tier1_1 = clock();
+
+    if (getenv("PDF_JPX_TIMING"))
+        fprintf(stderr, "TIMING tile: paquetes=%.3fs tier1=%.3fs\n",
+                (double)(t_packets1 - t_packets0) / CLOCKS_PER_SEC,
+                (double)(t_tier1_1 - t_packets1) / CLOCKS_PER_SEC);
     }
 
     /* --- sintesis final por componente ------------------------------ */
-    for (c = 0; c < siz->ncomp; c++)
     {
-        comp_planes[c] = jpx_component_synth(arena, &tc[c], (qcd_params *)qcd,
-                                              cod->cb_w, cod->cb_h,
-                                              cod->transform == 1, siz->prec[c], &comp_w[c], &comp_h[c]);
-        if (comp_planes[c] == NULL) return PDF_ERR_NOMEM;
+        clock_t t0 = clock();
+        for (c = 0; c < siz->ncomp; c++)
+        {
+            comp_planes[c] = jpx_component_synth(arena, &tc[c], (qcd_params *)qcd,
+                                                  cod->cb_w, cod->cb_h,
+                                                  cod->transform == 1, siz->prec[c], &comp_w[c], &comp_h[c]);
+            if (comp_planes[c] == NULL) return PDF_ERR_NOMEM;
+        }
+        if (getenv("PDF_JPX_TIMING"))
+            fprintf(stderr, "TIMING tile: sintesis=%.3fs\n", (double)(clock() - t0) / CLOCKS_PER_SEC);
     }
 
     return PDF_OK;
@@ -1808,10 +1988,12 @@ int pdf_filter_jpx(pdf_arena *arena, const unsigned char *src, long src_len, pdf
         else if (marker == 0x5C) { jpx_parse_qcd(cs + pos + 2, seg_len - 2, &qcd); have_qcd = 1; }
         else if (marker == 0x52 + 1) { /* COC: no soportado, ver limitaciones */ }
 
-        fprintf(stderr, "DEBUG marker FF%02X len=%ld pos=%ld\n", marker, seg_len, pos);
+        if (jpx_debug_on())
+            fprintf(stderr, "DEBUG marker FF%02X len=%ld pos=%ld\n", marker, seg_len, pos);
         pos += seg_len;
     }
-    fprintf(stderr, "DEBUG post-loop: have_siz=%d have_cod=%d have_qcd=%d pos=%ld\n", have_siz, have_cod, have_qcd, pos);
+    if (jpx_debug_on())
+        fprintf(stderr, "DEBUG post-loop: have_siz=%d have_cod=%d have_qcd=%d pos=%ld\n", have_siz, have_cod, have_qcd, pos);
     if (!have_siz || !have_cod || !have_qcd)
         return PDF_ERR_UNSUPPORTED;
     if (siz.ncomp < 1 || siz.ncomp > 4)
@@ -1824,9 +2006,10 @@ int pdf_filter_jpx(pdf_arena *arena, const unsigned char *src, long src_len, pdf
     }
     if (siz.Xsiz <= 0 || siz.Ysiz <= 0 || siz.Xsiz > 20000 || siz.Ysiz > 20000)
         return PDF_ERR_BADARG;
-    fprintf(stderr, "DEBUG SIZ: X=%ld Y=%ld ncomp=%d COD: prog=%d layers=%d mct=%d decomp=%d cbw=%d cbh=%d transform=%d QCD: style=%d guard=%d\n",
-            siz.Xsiz, siz.Ysiz, siz.ncomp, cod.prog_order, cod.num_layers, cod.mct, cod.num_decomp,
-            cod.cb_w, cod.cb_h, cod.transform, qcd.qstyle, qcd.guard_bits);
+    if (jpx_debug_on())
+        fprintf(stderr, "DEBUG SIZ: X=%ld Y=%ld ncomp=%d COD: prog=%d layers=%d mct=%d decomp=%d cbw=%d cbh=%d transform=%d QCD: style=%d guard=%d\n",
+                siz.Xsiz, siz.Ysiz, siz.ncomp, cod.prog_order, cod.num_layers, cod.mct, cod.num_decomp,
+                cod.cb_w, cod.cb_h, cod.transform, qcd.qstyle, qcd.guard_bits);
 
     ntx = (int)((siz.Xsiz - siz.XTOsiz + siz.XTsiz - 1) / siz.XTsiz);
     nty = (int)((siz.Ysiz - siz.YTOsiz + siz.YTsiz - 1) / siz.YTsiz);
@@ -2016,7 +2199,7 @@ int pdf_filter_jpx(pdf_arena *arena, const unsigned char *src, long src_len, pdf
                         double v0 = all_comp_planes[0][py * cws[0] + px];
                         double r, g, b;
 
-                        if (getenv("PDF_JPX_ONLY_V0"))
+                        if (jpx_only_v0_on())
                         {
                             r = g = b = v0;
                         }

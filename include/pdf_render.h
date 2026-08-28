@@ -416,6 +416,31 @@ void pdf_render_op(void *user, const char *opname, pdf_obj **args, int nargs);
  * el content stream. Ver DESIGN.md (fase AcroForm) y pdf_form.h. */
 void pdf_render_draw_annotations(pdf_render_device *dev, pdf_obj *page_obj);
 
+/* Igual que pdf_render_draw_annotations() pero para anotaciones
+ * /Subtype /Highlight (resaltado de texto, ver pdf_annot.h/DESIGN.md)
+ * -- recorre /Annots directo (no via pdf_form_list_fields, que es
+ * especifico de AcroForm), dibuja la apariencia (/AP/N) de cada
+ * Highlight que la tenga (se saltan, sin error, los que no -- ver
+ * limitacion de alcance en DESIGN.md), respetando /F Hidden/NoView
+ * igual que el camino de Widgets. Llamar junto con
+ * pdf_render_draw_annotations(), mismo momento (despues del content
+ * stream de la pagina). */
+void pdf_render_draw_highlight_annotations(pdf_render_device *dev, pdf_obj *page_obj);
+
+/* Ver comentario grande junto a la implementacion, pdf_render.c --
+ * convierte un punto del espacio "topdown" que usa la extraccion de
+ * texto/seleccion (pdf_text_extract_page(), aSelRanges en
+ * pdf_viewer.prg) de vuelta al espacio de usuario PDF NATIVO
+ * (bottom-up, sin rotar) que exige la norma para /Rect y /QuadPoints.
+ * 'rotate_deg' es el /Rotate NATIVO heredado de la pagina -- NUNCA
+ * ::nUserRotate. Devuelve 0 (sin tocar las salidas) si la matriz
+ * resultara degenerada. */
+int pdf_render_topdown_to_native(int rotate_deg,
+                                  double crop_x0, double crop_y0,
+                                  double page_w, double page_h,
+                                  double topdown_x, double topdown_y,
+                                  double *out_x, double *out_y);
+
 #ifdef __cplusplus
 }
 #endif

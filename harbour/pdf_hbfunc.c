@@ -24,6 +24,11 @@
  *   PDF_RENDERTOHBITMAP( pDoc, nPagina, nScale, nExtraRotate )    -> { hBitmap, nWidth, nHeight } o NIL
  *      (nScale y nExtraRotate opcionales, default 0 -- nExtraRotate se SUMA
  *      al /Rotate propio del PDF, en grados multiplo de 90)
+ *   PDF_GETPAGESIZEPT( pDoc, nPagina, nExtraRotate ) -> { anchoPt, altoPt } o NIL
+ *      (tamanio de pagina en puntos PDF, MISMO calculo que
+ *      PDF_RENDERTOHBITMAP pero SIN decodificar/rasterizar nada --
+ *      para cuando solo hace falta saber el tamanio, ver
+ *      METHOD RenderCurrentPage() en pdf_viewer.prg)
  *
  * PDF_RENDERTOHBITMAP hace TODO el trabajo (abrir pagina, decodificar el
  * content stream, interpretar, rasterizar) y devuelve un HBITMAP de Windows
@@ -52,6 +57,7 @@
 #include "pdf_text_extract.h"
 #include "pdf_form.h"
 #include "pdf_write.h"
+#include "pdf_annot.h"
 
 /* Cache de texto extraido (fase 2 del roadmap de potencialidad MuPDF --
  * ver DESIGN.md seccion 70): PDF_EXTRACTTEXT/PDF_FINDTEXT/
@@ -1222,6 +1228,103 @@ HB_FUNC(PDF_PAGECOUNT)
     hb_retnl(count);
 }
 
+/* PDF_GETPAGESIZEPT( pDoc, nPagina, nExtraRotate ) -> { anchoPt, altoPt }
+ * o NIL. Mismo calculo de tamanio de pagina (CropBox intersectado con
+ * MediaBox, con /Rotate + rotacion extra ya swappeando ancho/alto para
+ * 90/270) que PDF_RENDERTOHBITMAP, pero SIN decodificar el content
+ * stream ni rasterizar nada -- Arturo reporto que abrir un documento
+ * con muchas imagenes JPEG2000 pesadas (ver DESIGN.md seccion 75, el
+ * fix de multiples capas de calidad que las hace tardar de verdad en
+ * vez de fallar rapido y mal) se sentia "colgado": RenderCurrentPage()
+ * hacia un primer render A ESCALA 1.0 SOLO para conocer el tamanio de
+ * la pagina en puntos (ver pdf_viewer.prg), pagando el costo COMPLETO
+ * de decodificar todas las imagenes de la pagina nada mas que para
+ * leer dos numeros. Este binding nuevo hace ESO MISMO sin renderizar
+ * -- pdf_viewer.prg ahora lo llama en vez de la pasada de "medir"
+ * (ver comentario grande en METHOD RenderCurrentPage()). */
+HB_FUNC(PDF_GETPAGESIZEPT)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    int extra_rotate = hb_parni(3);
+    pdf_page page;
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+
+    if (h == NULL || !h->open)
+    {
+        hb_ret();
+        return;
+    }
+    if (pdf_page_open(&page, &h->doc, page_index + 1) != PDF_OK)
+    {
+        hb_ret();
+        return;
+    }
+    page_obj = pdf_document_get_page(&h->st, &h->xref, &page.page_arena, page_index);
+    if (page_obj == NULL)
+    {
+        pdf_page_close(&page);
+        hb_ret();
+        return;
+    }
+
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &page.page_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &page.page_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+    rotate = pdf_normalize_rotation(rotate + extra_rotate);
+    if (rotate == 90 || rotate == 270)
+    {
+        double t = page_w; page_w = page_h; page_h = t;
+    }
+
+    pdf_page_close(&page);
+
+    hb_reta(2);
+    hb_storvnd(page_w, -1, 1);
+    hb_storvnd(page_h, -1, 2);
+}
+
 HB_FUNC(PDF_RENDERTOHBITMAP)
 {
     pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
@@ -1396,6 +1499,13 @@ HB_FUNC(PDF_RENDERTOHBITMAP)
          * ENCIMA del contenido de pagina (asi lo exige la norma) --
          * ver DESIGN.md, fase AcroForm. */
         pdf_render_draw_annotations(&dev, page_obj);
+
+        /* Resaltado de texto (/Subtype /Highlight, ver pdf_annot.h/
+         * DESIGN.md) -- mismo momento que las anotaciones de arriba
+         * (encima del contenido de pagina), cubre tanto los resaltados
+         * agregados en esta sesion (HB_FUNC(PDF_ANNOTADDHIGHLIGHT))
+         * como cualquier /Highlight preexistente en el archivo. */
+        pdf_render_draw_highlight_annotations(&dev, page_obj);
 
         if (gdi_ok)
             pdf_gdi_text_ctx_destroy(&gdi_text);
@@ -2144,4 +2254,255 @@ HB_FUNC(PDF_FORMSAVE)
                                        h->n_touched, out_path);
 
     hb_retl(rc == PDF_OK ? HB_TRUE : HB_FALSE);
+}
+
+/* Pdf_AnnotAddHighlight( pDoc, nPagina, aRects ) -> lReturn
+ *     Agrega una anotacion /Highlight nueva a la pagina 'nPagina',
+ *     cubriendo los rectangulos de 'aRects' (array de {x0,y0,x1,y1},
+ *     4 numeros cada uno -- MISMO formato "topdown" local a la pagina
+ *     que las columnas 4-7 de TPdfBitmap:aSelRanges en pdf_viewer.prg,
+ *     un rect por linea visual de texto seleccionada). No escribe nada
+ *     al archivo todavia -- solo muta el documento EN MEMORIA (mismo
+ *     mecanismo "touched objects" que Pdf_FormSetFieldValue); hace
+ *     falta llamar Pdf_FormSave() despues para persistir, igual que
+ *     una edicion de AcroForm (mismo boton "Guardar" de la UI, generico
+ *     -- ver DESIGN.md).
+ *
+ *     Color/opacidad fijos en esta primera version: amarillo (1,1,0)
+ *     con blend Multiply al 40% -- sin selector de color todavia. */
+HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    PHB_ITEM aRects = hb_param(3, HB_IT_ARRAY);
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj;
+    long page_obj_num = -1;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+    HB_SIZE n_rects, ri;
+    int n_quads;
+    double quads[PDF_ANNOT_MAX_QUADS * 8];
+    double bbox[4];
+    long ap_num, annot_num;
+    pdf_obj *ap_obj, *annot_obj;
+    pdf_obj *annots;
+
+    if (h == NULL || !h->open || page_index < 0 || aRects == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Guardas tempranas -- ver DESIGN.md (fase de resaltado de texto):
+     * documento encriptado (misma limitacion que Pdf_FormSave, escribir
+     * contenido nuevo exige direccion ENCRYPT, fuera de alcance);
+     * cache de resolucion de objetos caido (ver pdf_xref.h) -- sin el,
+     * una segunda mutacion de la MISMA pagina en esta sesion (otro
+     * resaltado, o un re-render) resolveria una copia INDEPENDIENTE en
+     * vez del mismo puntero ya mutado, perdiendo la primera mutacion
+     * silenciosamente; headroom en touched[] -- esta operacion necesita
+     * hasta 3 slots nuevos (apariencia, anotacion, pagina-o-array). */
+    if (h->xref.crypt.active)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->xref.resolved == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->n_touched + 3 > PDF_HB_MAX_TOUCHED_OBJS)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    page_obj = pdf_document_get_page_ex(&h->st, &h->xref, &h->doc.doc_arena, page_index, &page_obj_num);
+    if (page_obj == NULL || page_obj_num <= 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
+     * calculo que PDF_GETPAGESIZEPT/PDF_RENDERTOHBITMAP/
+     * pdf_text_extract_page (4 copias del mismo bloque en el motor,
+     * cada una con este comentario cruzado -- si se corrige un bug aca
+     * corregirlo en las otras 3 tambien). A diferencia de esas, NO se
+     * intercambian ancho/alto para /Rotate 90/270: 'page_w'/'page_h'
+     * tienen que ser las dimensiones NATIVAS (sin rotar), que es lo que
+     * espera pdf_render_topdown_to_native() (mismo criterio que
+     * dev->page_width_pt/page_height_pt en pdf_render.c, que tampoco
+     * se intercambian). */
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+
+    /* Cada rect de 'aRects' (topdown local) -> un quad TL/TR/BL/BR en
+     * espacio nativo. No se asume que el orden de esquinas sobrevive
+     * la rotacion -- se transforman AMBOS puntos y se toma min/max. */
+    n_rects = hb_arrayLen(aRects);
+    n_quads = 0;
+    bbox[0] = bbox[1] = bbox[2] = bbox[3] = 0.0;
+
+    for (ri = 1; ri <= n_rects && n_quads < PDF_ANNOT_MAX_QUADS; ri++)
+    {
+        PHB_ITEM aRow = hb_arrayGetItemPtr(aRects, ri);
+        double tx0, ty0, tx1, ty1;
+        double nx0, ny0, nx1, ny1;
+        double rx0, ry0, rx1, ry1;
+        double *q;
+
+        if (aRow == NULL || !HB_IS_ARRAY(aRow) || hb_arrayLen(aRow) < 4)
+            continue;
+
+        tx0 = hb_arrayGetND(aRow, 1);
+        ty0 = hb_arrayGetND(aRow, 2);
+        tx1 = hb_arrayGetND(aRow, 3);
+        ty1 = hb_arrayGetND(aRow, 4);
+
+        if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h,
+                                           tx0, ty0, &nx0, &ny0))
+            continue;
+        if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h,
+                                           tx1, ty1, &nx1, &ny1))
+            continue;
+
+        rx0 = (nx0 < nx1) ? nx0 : nx1;
+        rx1 = (nx0 < nx1) ? nx1 : nx0;
+        ry0 = (ny0 < ny1) ? ny0 : ny1;
+        ry1 = (ny0 < ny1) ? ny1 : ny0;
+
+        if (n_quads == 0)
+        {
+            bbox[0] = rx0; bbox[1] = ry0; bbox[2] = rx1; bbox[3] = ry1;
+        }
+        else
+        {
+            if (rx0 < bbox[0]) bbox[0] = rx0;
+            if (ry0 < bbox[1]) bbox[1] = ry0;
+            if (rx1 > bbox[2]) bbox[2] = rx1;
+            if (ry1 > bbox[3]) bbox[3] = ry1;
+        }
+
+        /* TL,TR,BL,BR -- mismo orden de QuadPoints (ver pdf_annot.h). */
+        q = &quads[n_quads * 8];
+        q[0] = rx0; q[1] = ry1; /* TL */
+        q[2] = rx1; q[3] = ry1; /* TR */
+        q[4] = rx0; q[5] = ry0; /* BL */
+        q[6] = rx1; q[7] = ry0; /* BR */
+        n_quads++;
+    }
+
+    if (n_quads == 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    ap_num = h->next_new_obj_num++;
+    annot_num = h->next_new_obj_num++;
+
+    ap_obj = pdf_annot_generate_highlight_appearance(&h->doc.doc_arena, quads, n_quads,
+                                                       1.0, 1.0, 0.0, 0.4, ap_num, bbox);
+    if (ap_obj == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    annot_obj = pdf_annot_new_highlight(&h->doc.doc_arena, bbox, quads, n_quads,
+                                          1.0, 1.0, 0.0, ap_obj);
+    if (annot_obj == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Resolver /Annots de la pagina -- 3 casos (ver DESIGN.md). El gen
+     * de cualquier objeto tocado sale SIEMPRE de la tabla xref
+     * (pdf_xref_entry_at), nunca asumido 0 ni tomado de un PDF_REF
+     * literal. */
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+    {
+        long annots_num = annots->u.ref.num;
+        const pdf_xref_entry *annots_entry;
+
+        annots = pdf_xref_load_object(&h->st, &h->xref, annots_num, &h->doc.doc_arena);
+        if (annots == NULL || annots->type != PDF_ARRAY)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        if (pdf_array_push(&h->doc.doc_arena, annots, pdf_obj_new_ref(&h->doc.doc_arena, annot_num, 0)) != PDF_OK)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        annots_entry = pdf_xref_entry_at(&h->xref, annots_num);
+        mark_touched(h, annots_num, (annots_entry != NULL) ? annots_entry->gen : 0, annots);
+    }
+    else
+    {
+        const pdf_xref_entry *page_entry;
+
+        if (annots == NULL || annots->type != PDF_ARRAY)
+        {
+            annots = pdf_obj_new_array(&h->doc.doc_arena, 4);
+            pdf_dict_set(&h->doc.doc_arena, page_obj, "Annots", annots);
+        }
+        if (pdf_array_push(&h->doc.doc_arena, annots, pdf_obj_new_ref(&h->doc.doc_arena, annot_num, 0)) != PDF_OK)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        page_entry = pdf_xref_entry_at(&h->xref, page_obj_num);
+        mark_touched(h, page_obj_num, (page_entry != NULL) ? page_entry->gen : 0, page_obj);
+    }
+
+    mark_touched(h, ap_num, 0, ap_obj);
+    mark_touched(h, annot_num, 0, annot_obj);
+
+    hb_retl(HB_TRUE);
 }

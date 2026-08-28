@@ -108,6 +108,12 @@ typedef struct pdf_cff_font_s
 
     double units_per_em;  /* de FontMatrix (Top DICT), default 1000.0 */
     int    num_glyphs;
+
+    /* Private DICT nominalWidthX/defaultWidthX (operadores 21/20) --
+     * ver comentario grande junto a pdf_cff_glyph_width. Default 0.0/0.0
+     * (igual que el spec) si el Private DICT no los trae. */
+    double nominal_width_x;
+    double default_width_x;
 } pdf_cff_font;
 
 /* Parsea 'data'/'len' (programa CFF ya descomprimido, tal cual sale de
@@ -143,6 +149,45 @@ typedef void (*pdf_cff_curveto_fn)(void *user, double x1, double y1,
 int pdf_cff_glyph_outline(const pdf_cff_font *font, int gid,
                            pdf_cff_moveto_fn moveto, pdf_cff_lineto_fn lineto,
                            pdf_cff_curveto_fn curveto, void *user);
+
+/* BUG REAL ENCONTRADO (ver DESIGN.md, ronda "fuentes con /Widths
+ * incompleto"): confirmado contra un PDF real
+ * (Agentes_de_inteligencia_artificial_y_workflows.pdf) exportado desde
+ * Adobe InDesign -- un mismo font subset (BiomePro-SemiBold, via
+ * FontFile3) aparece declarado en MULTIPLES objetos /Font distintos
+ * (uno por cada cuadro de texto/Form XObject donde InDesign lo usa),
+ * cada uno con SU PROPIO array /Widths recortado a los codigos que ESE
+ * cuadro de texto usa -- pero al menos uno de esos arrays quedo mal
+ * generado por InDesign: varios codigos REALMENTE USADOS en ese cuadro
+ * (confirmado 'L' mayuscula, entre otros) declaran ancho 0 en vez del
+ * ancho real, pese a que el glyph SI existe y se dibuja bien (el
+ * contorno viene de este mismo programa CFF). Con ancho declarado 0,
+ * el motor pisa cada glyph sobre el siguiente (avance nulo) --
+ * exactamente el sintoma reportado ("no hay una muestra perfecta de
+ * los fonts de este documento", encabezado con letras superpuestas).
+ * Confirmado con una referencia real (fontTools, parseando este mismo
+ * programa CFF): el glyph 'L' SI tiene un ancho real de 612 unidades
+ * codificado en su propio charstring -- exactamente el mismo valor que
+ * otro objeto /Font (con /Widths completo) para ESTE MISMO glyph en
+ * ESTE MISMO documento. La corrupcion es del /Widths de ESE objeto en
+ * particular (un defecto real del PDF, no de este parser -- ver
+ * pdf_xref.c/pdf_font.c, se investigo y descarto una miscompilacion de
+ * bcc32 antes de llegar a esta conclusion), asi que la unica forma de
+ * mostrar el texto correctamente es no confiar ciegamente en un ancho
+ * declarado de 0 cuando el font PROGRAMA embebido sabe algo mejor.
+ * Extrae el ancho de avance REAL del glyph 'gid', tal como esta
+ * codificado en su propio Type 2 charstring (operando "extra" del
+ * primer operador que limpia la pila -- hstem/vstem(hm)/hintmask/
+ * cntrmask/moveto/endchar -- interpretado via nominalWidthX si esta
+ * presente, o defaultWidthX si no). Pensado como FALLBACK exclusivo de
+ * pdf_font.c para cuando /Widths[code] es exactamente 0 -- el PDF sigue
+ * siendo la fuente de verdad para cualquier ancho no-cero (un ancho 0
+ * legitimo, como una marca diacritica combinante, es indistinguible de
+ * este defecto SIN esta heuristica, pero es mucho mas raro en la
+ * practica que este tipo de exportacion rota). Devuelve PDF_OK (con
+ * '*out_width' en unidades de 1/1000 em, mismo escalado que /Widths del
+ * PDF) o un error si el glyph no tiene contorno/charstring valido. */
+int pdf_cff_glyph_width(const pdf_cff_font *font, int gid, double *out_width);
 
 #ifdef __cplusplus
 }

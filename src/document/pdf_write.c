@@ -201,7 +201,15 @@ static void write_indirect_object(FILE *out, pdf_obj *obj, long num, long gen)
     }
     else
     {
-        write_dict_entries(out, (obj->type == PDF_DICT) ? obj->u.dict.first : NULL);
+        /* BUG REAL ENCONTRADO (fase de resaltado de texto, ver DESIGN.md):
+         * esta rama solo sabia serializar PDF_DICT -- si se marca como
+         * "tocado" un objeto PDF_ARRAY (caso real: /Annots de una pagina
+         * guardado como referencia indirecta a un array suelto, layout
+         * comun en PDFs reales), escribia "<< >>" (dict vacio) en vez del
+         * array, perdiendo TODO su contenido anterior. write_obj_value ya
+         * distingue PDF_DICT/PDF_ARRAY/etc correctamente -- para PDF_DICT
+         * el resultado es identico a antes (misma write_dict_entries). */
+        write_obj_value(out, obj);
         fprintf(out, "\nendobj\n");
     }
 }

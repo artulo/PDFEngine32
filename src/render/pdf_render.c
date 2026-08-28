@@ -237,24 +237,32 @@ static pdf_point to_pixel(pdf_render_device *dev, pdf_point p)
  * crop_y0, ver to_pixel() y el comentario de pdf_render_device_s) --
  * derivado sustituyendo u=(x-crop_x0)*s, v=ph-(y-crop_y0)*s en las
  * mismas 4 formulas de to_pixel(). */
-static pdf_matrix rotation_to_pixel_matrix(pdf_render_device *dev)
+/* Cuerpo de rotation_to_pixel_matrix() de abajo, parametrizado por
+ * escalares en vez de un pdf_render_device* -- factorizado en la fase
+ * de resaltado de texto para que pdf_render_topdown_to_native() (mas
+ * abajo) pueda construir la MISMA matriz con scale=1.0 (el espacio que
+ * usa pdf_text_extract_page(), no el de render a bitmap) y devolver su
+ * inversa, sin duplicar la formula a mano en un segundo lugar donde
+ * pudiera desincronizarse del renderer real. */
+static pdf_matrix rotation_matrix_params(double scale, double page_w_pt, double page_h_pt,
+                                          double crop_x0, double crop_y0, int rotate)
 {
     pdf_matrix m;
-    double s = dev->scale;
-    double pw = dev->page_width_pt * s;
-    double ph = dev->page_height_pt * s;
-    double cx = dev->crop_x0 * s;
-    double cy = dev->crop_y0 * s;
+    double s = scale;
+    double pw = page_w_pt * s;
+    double ph = page_h_pt * s;
+    double cx = crop_x0 * s;
+    double cy = crop_y0 * s;
 
-    if (dev->rotate == 90)
+    if (rotate == 90)
     {
         m.a = 0.0;  m.b = s;    m.c = s;    m.d = 0.0;  m.e = -cy; m.f = -cx;
     }
-    else if (dev->rotate == 180)
+    else if (rotate == 180)
     {
         m.a = -s;   m.b = 0.0;  m.c = 0.0;  m.d = s;    m.e = pw + cx;  m.f = -cy;
     }
-    else if (dev->rotate == 270)
+    else if (rotate == 270)
     {
         m.a = 0.0;  m.b = -s;   m.c = -s;   m.d = 0.0;  m.e = ph + cy;  m.f = pw + cx;
     }
@@ -264,6 +272,45 @@ static pdf_matrix rotation_to_pixel_matrix(pdf_render_device *dev)
     }
 
     return m;
+}
+
+static pdf_matrix rotation_to_pixel_matrix(pdf_render_device *dev)
+{
+    return rotation_matrix_params(dev->scale, dev->page_width_pt, dev->page_height_pt,
+                                   dev->crop_x0, dev->crop_y0, dev->rotate);
+}
+
+/* Inversa exacta de rotation_to_pixel_matrix()/to_pixel() con scale=1.0
+ * -- el mismo espacio "topdown" que usa pdf_text_extract_page() para
+ * ubicar glyphs (y por lo tanto el mismo que aSelRanges en
+ * pdf_viewer.prg): puntos PDF, Y invertida, con /CropBox y /Rotate
+ * NATIVO de la pagina ya aplicados. Convierte de vuelta al espacio de
+ * usuario PDF NATIVO (bottom-up, sin rotar) que exige la norma para
+ * /Rect y /QuadPoints -- ver HB_FUNC(PDF_ANNOT_ADDHIGHLIGHT) en
+ * pdf_hbfunc.c, unico consumidor hoy. 'rotate_deg' es el /Rotate
+ * NATIVO heredado de la pagina (normalizado a 0/90/180/270) -- NUNCA
+ * ::nUserRotate (rotacion de VISTA del boton "Rotar", que aSelRanges
+ * nunca incluye, ver comentario grande en el call site). Devuelve 0
+ * (sin tocar '*out_x'/'*out_y') si la matriz resultara degenerada --
+ * no deberia pasar con los 4 casos soportados, pero mat_invert() ya
+ * expone ese chequeo y no hay razon para no propagarlo. */
+int pdf_render_topdown_to_native(int rotate_deg,
+                                  double crop_x0, double crop_y0,
+                                  double page_w, double page_h,
+                                  double topdown_x, double topdown_y,
+                                  double *out_x, double *out_y)
+{
+    pdf_matrix fwd = rotation_matrix_params(1.0, page_w, page_h, crop_x0, crop_y0, rotate_deg);
+    pdf_matrix inv;
+    pdf_point p;
+
+    if (!mat_invert(fwd, &inv))
+        return 0;
+
+    p = mat_transform(inv, topdown_x, topdown_y);
+    *out_x = p.x;
+    *out_y = p.y;
+    return 1;
 }
 
 /* Se llama SIEMPRE al terminar de pintar (o descartar, para 'n') el
@@ -2205,6 +2252,124 @@ static void reset_gstate_default(pdf_gstate *gs, int bitmap_w, int bitmap_h)
     gs->render_mode       = 0;
 }
 
+/* Cuerpo compartido de "resolver /AP/N (con /AS si es dict de estados),
+ * mapear /BBox transformado por /Matrix al /Rect via el algoritmo Appearance Streams
+ * (norma 12.5.5), y dibujar" -- extraido de pdf_render_draw_annotations
+ * en la fase de resaltado de texto para reusarlo tambien con
+ * anotaciones /Highlight (pdf_render_draw_highlight_annotations, mas
+ * abajo). Nada aca es especifico de AcroForm: 'annot_obj' es cualquier
+ * dict de anotacion con /F/AP/AS, 'rect' es su /Rect ya resuelto -- el
+ * unico uso de /AS (estado actual para un dict de sub-apariencias) es
+ * el mecanismo GENERAL de la norma, no algo propio de campos Widget
+ * (aunque en la practica solo los Widget checkbox lo usan). */
+static void draw_annot_appearance(pdf_render_device *dev, pdf_obj *annot_obj, pdf_rect rect)
+{
+    pdf_obj *flags_obj, *ap, *ap_n, *appearance;
+    pdf_obj *bbox_obj, *matrix_obj;
+    long annot_flags;
+    double bx0 = 0.0, by0 = 0.0, bx1 = 1.0, by1 = 1.0;
+    pdf_matrix fm;
+    pdf_point t0, t1, t2, t3;
+    double tminx, tmaxx, tminy, tmaxy;
+    pdf_matrix a_mat;
+    double sx, sy;
+    pdf_gstate *gs;
+
+    flags_obj = pdf_dict_get(annot_obj, "F");
+    annot_flags = (flags_obj != NULL) ? (long)pdf_obj_num(flags_obj, 0.0) : 0;
+    if (annot_flags & 0x2)  return; /* Hidden */
+    if (annot_flags & 0x20) return; /* NoView */
+
+    ap = pdf_dict_get(annot_obj, "AP");
+    if (ap != NULL && ap->type == PDF_REF)
+        ap = pdf_parser_load_object(dev->st, dev->xref, ap->u.ref.num, dev->arena);
+    if (ap == NULL) return;
+
+    ap_n = pdf_dict_get(ap, "N");
+    if (ap_n != NULL && ap_n->type == PDF_REF)
+        ap_n = pdf_parser_load_object(dev->st, dev->xref, ap_n->u.ref.num, dev->arena);
+    if (ap_n == NULL) return;
+
+    appearance = NULL;
+    if (ap_n->type == PDF_STREAM)
+    {
+        appearance = ap_n;
+    }
+    else if (ap_n->type == PDF_DICT)
+    {
+        /* checkbox u otro campo de estados: /AS (estado actual del
+         * widget) elige la sub-entrada; sin /AS, /Off por defecto. */
+        const char *as_name = pdf_dict_get_name(annot_obj, "AS");
+        pdf_obj *sub = (as_name != NULL) ? pdf_dict_get(ap_n, as_name) : NULL;
+        if (sub == NULL) sub = pdf_dict_get(ap_n, "Off");
+        if (sub != NULL && sub->type == PDF_REF)
+            sub = pdf_parser_load_object(dev->st, dev->xref, sub->u.ref.num, dev->arena);
+        if (sub != NULL && sub->type == PDF_STREAM)
+            appearance = sub;
+    }
+    if (appearance == NULL) return;
+
+    bbox_obj = pdf_dict_get(appearance, "BBox");
+    if (bbox_obj != NULL && bbox_obj->type == PDF_ARRAY && bbox_obj->u.arr.count == 4)
+    {
+        bx0 = pdf_obj_num(bbox_obj->u.arr.items[0], 0.0);
+        by0 = pdf_obj_num(bbox_obj->u.arr.items[1], 0.0);
+        bx1 = pdf_obj_num(bbox_obj->u.arr.items[2], 1.0);
+        by1 = pdf_obj_num(bbox_obj->u.arr.items[3], 1.0);
+    }
+
+    fm.a = 1.0; fm.b = 0.0; fm.c = 0.0; fm.d = 1.0; fm.e = 0.0; fm.f = 0.0;
+    matrix_obj = pdf_dict_get(appearance, "Matrix");
+    if (matrix_obj != NULL && matrix_obj->type == PDF_ARRAY && matrix_obj->u.arr.count == 6)
+    {
+        fm.a = pdf_obj_num(matrix_obj->u.arr.items[0], 1.0);
+        fm.b = pdf_obj_num(matrix_obj->u.arr.items[1], 0.0);
+        fm.c = pdf_obj_num(matrix_obj->u.arr.items[2], 0.0);
+        fm.d = pdf_obj_num(matrix_obj->u.arr.items[3], 1.0);
+        fm.e = pdf_obj_num(matrix_obj->u.arr.items[4], 0.0);
+        fm.f = pdf_obj_num(matrix_obj->u.arr.items[5], 0.0);
+    }
+
+    /* Algoritmo "Appearance streams" (norma 12.5.5): transformar
+     * las 4 esquinas de /BBox por /Matrix, tomar el bounding box
+     * resultante, y calcular la matriz A (solo escala+traslacion,
+     * sin rotacion -- la norma no la pide aca) que mapea ESE
+     * bounding box al /Rect de la anotacion. draw_form_xobject()
+     * concatena /Matrix DE NUEVO sobre lo que le pasemos como CTM
+     * -- si le damos ctm=A, el resultado es Matrix*A, exactamente
+     * lo que exige la norma (no es una doble aplicacion). */
+    t0 = mat_transform(fm, bx0, by0);
+    t1 = mat_transform(fm, bx1, by0);
+    t2 = mat_transform(fm, bx1, by1);
+    t3 = mat_transform(fm, bx0, by1);
+    tminx = t0.x; tmaxx = t0.x; tminy = t0.y; tmaxy = t0.y;
+    if (t1.x < tminx) tminx = t1.x; if (t1.x > tmaxx) tmaxx = t1.x;
+    if (t1.y < tminy) tminy = t1.y; if (t1.y > tmaxy) tmaxy = t1.y;
+    if (t2.x < tminx) tminx = t2.x; if (t2.x > tmaxx) tmaxx = t2.x;
+    if (t2.y < tminy) tminy = t2.y; if (t2.y > tmaxy) tmaxy = t2.y;
+    if (t3.x < tminx) tminx = t3.x; if (t3.x > tmaxx) tmaxx = t3.x;
+    if (t3.y < tminy) tminy = t3.y; if (t3.y > tmaxy) tmaxy = t3.y;
+
+    sx = ((tmaxx - tminx) > 1e-6) ? (rect.x1 - rect.x0) / (tmaxx - tminx) : 1.0;
+    sy = ((tmaxy - tminy) > 1e-6) ? (rect.y1 - rect.y0) / (tmaxy - tminy) : 1.0;
+
+    a_mat.a = sx; a_mat.b = 0.0; a_mat.c = 0.0; a_mat.d = sy;
+    a_mat.e = rect.x0 - tminx * sx;
+    a_mat.f = rect.y0 - tminy * sy;
+
+    /* Gstate "limpio" en el tope del stack para ESTA anotacion --
+     * nunca hereda nada de la anotacion anterior ni del final del
+     * content stream de la pagina. */
+    dev->gstate_top = 0;
+    gs = cur_gstate(dev);
+    reset_gstate_default(gs, dev->bitmap->width, dev->bitmap->height);
+    gs->ctm = a_mat;
+    pdf_bitmap_set_clip(dev->bitmap, gs->clip_x0, gs->clip_y0, gs->clip_x1, gs->clip_y1);
+    pdf_bitmap_set_clip_mask(dev->bitmap, NULL, 0);
+
+    draw_form_xobject(dev, appearance);
+}
+
 void pdf_render_draw_annotations(pdf_render_device *dev, pdf_obj *page_obj)
 {
     pdf_form_field fields[PDF_FORM_MAX_FIELDS];
@@ -2219,111 +2384,57 @@ void pdf_render_draw_annotations(pdf_render_device *dev, pdf_obj *page_obj)
     for (i = 0; i < n; i++)
     {
         pdf_form_field *f = &fields[i];
-        pdf_obj *flags_obj, *ap, *ap_n, *appearance;
-        pdf_obj *bbox_obj, *matrix_obj;
-        long annot_flags;
-        double bx0 = 0.0, by0 = 0.0, bx1 = 1.0, by1 = 1.0;
-        pdf_matrix fm;
-        pdf_point t0, t1, t2, t3;
-        double tminx, tmaxx, tminy, tmaxy;
-        pdf_matrix a_mat;
-        double sx, sy;
-        pdf_gstate *gs;
-
         if (f->widget_obj == NULL) continue;
+        draw_annot_appearance(dev, f->widget_obj, f->rect);
+    }
+}
 
-        flags_obj = pdf_dict_get(f->widget_obj, "F");
-        annot_flags = (flags_obj != NULL) ? (long)pdf_obj_num(flags_obj, 0.0) : 0;
-        if (annot_flags & 0x2)  continue; /* Hidden */
-        if (annot_flags & 0x20) continue; /* NoView */
+/* Ver comentario grande junto a la declaracion, pdf_render.h. */
+void pdf_render_draw_highlight_annotations(pdf_render_device *dev, pdf_obj *page_obj)
+{
+    pdf_obj *annots;
+    int i;
 
-        ap = pdf_dict_get(f->widget_obj, "AP");
-        if (ap != NULL && ap->type == PDF_REF)
-            ap = pdf_parser_load_object(dev->st, dev->xref, ap->u.ref.num, dev->arena);
-        if (ap == NULL) continue;
+    if (dev == NULL || page_obj == NULL || dev->st == NULL || dev->xref == NULL ||
+        dev->arena == NULL || dev->bitmap == NULL)
+        return;
 
-        ap_n = pdf_dict_get(ap, "N");
-        if (ap_n != NULL && ap_n->type == PDF_REF)
-            ap_n = pdf_parser_load_object(dev->st, dev->xref, ap_n->u.ref.num, dev->arena);
-        if (ap_n == NULL) continue;
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+        annots = pdf_parser_load_object(dev->st, dev->xref, annots->u.ref.num, dev->arena);
+    if (annots == NULL || annots->type != PDF_ARRAY)
+        return;
 
-        appearance = NULL;
-        if (ap_n->type == PDF_STREAM)
-        {
-            appearance = ap_n;
-        }
-        else if (ap_n->type == PDF_DICT)
-        {
-            /* checkbox u otro campo de estados: /AS (estado actual del
-             * widget) elige la sub-entrada; sin /AS, /Off por defecto. */
-            const char *as_name = pdf_dict_get_name(f->widget_obj, "AS");
-            pdf_obj *sub = (as_name != NULL) ? pdf_dict_get(ap_n, as_name) : NULL;
-            if (sub == NULL) sub = pdf_dict_get(ap_n, "Off");
-            if (sub != NULL && sub->type == PDF_REF)
-                sub = pdf_parser_load_object(dev->st, dev->xref, sub->u.ref.num, dev->arena);
-            if (sub != NULL && sub->type == PDF_STREAM)
-                appearance = sub;
-        }
-        if (appearance == NULL) continue;
+    for (i = 0; i < annots->u.arr.count; i++)
+    {
+        pdf_obj *annot = annots->u.arr.items[i];
+        const char *subtype;
+        pdf_obj *rect_obj;
+        pdf_rect rect;
+        double rx0, ry0, rx1, ry1;
 
-        bbox_obj = pdf_dict_get(appearance, "BBox");
-        if (bbox_obj != NULL && bbox_obj->type == PDF_ARRAY && bbox_obj->u.arr.count == 4)
-        {
-            bx0 = pdf_obj_num(bbox_obj->u.arr.items[0], 0.0);
-            by0 = pdf_obj_num(bbox_obj->u.arr.items[1], 0.0);
-            bx1 = pdf_obj_num(bbox_obj->u.arr.items[2], 1.0);
-            by1 = pdf_obj_num(bbox_obj->u.arr.items[3], 1.0);
-        }
+        if (annot != NULL && annot->type == PDF_REF)
+            annot = pdf_parser_load_object(dev->st, dev->xref, annot->u.ref.num, dev->arena);
+        if (annot == NULL || (annot->type != PDF_DICT && annot->type != PDF_STREAM))
+            continue;
 
-        fm.a = 1.0; fm.b = 0.0; fm.c = 0.0; fm.d = 1.0; fm.e = 0.0; fm.f = 0.0;
-        matrix_obj = pdf_dict_get(appearance, "Matrix");
-        if (matrix_obj != NULL && matrix_obj->type == PDF_ARRAY && matrix_obj->u.arr.count == 6)
-        {
-            fm.a = pdf_obj_num(matrix_obj->u.arr.items[0], 1.0);
-            fm.b = pdf_obj_num(matrix_obj->u.arr.items[1], 0.0);
-            fm.c = pdf_obj_num(matrix_obj->u.arr.items[2], 0.0);
-            fm.d = pdf_obj_num(matrix_obj->u.arr.items[3], 1.0);
-            fm.e = pdf_obj_num(matrix_obj->u.arr.items[4], 0.0);
-            fm.f = pdf_obj_num(matrix_obj->u.arr.items[5], 0.0);
-        }
+        subtype = pdf_dict_get_name(annot, "Subtype");
+        if (subtype == NULL || strcmp(subtype, "Highlight") != 0)
+            continue;
 
-        /* Algoritmo "Appearance streams" (norma 12.5.5): transformar
-         * las 4 esquinas de /BBox por /Matrix, tomar el bounding box
-         * resultante, y calcular la matriz A (solo escala+traslacion,
-         * sin rotacion -- la norma no la pide aca) que mapea ESE
-         * bounding box al /Rect del widget. draw_form_xobject()
-         * concatena /Matrix DE NUEVO sobre lo que le pasemos como CTM
-         * -- si le damos ctm=A, el resultado es Matrix*A, exactamente
-         * lo que exige la norma (no es una doble aplicacion). */
-        t0 = mat_transform(fm, bx0, by0);
-        t1 = mat_transform(fm, bx1, by0);
-        t2 = mat_transform(fm, bx1, by1);
-        t3 = mat_transform(fm, bx0, by1);
-        tminx = t0.x; tmaxx = t0.x; tminy = t0.y; tmaxy = t0.y;
-        if (t1.x < tminx) tminx = t1.x; if (t1.x > tmaxx) tmaxx = t1.x;
-        if (t1.y < tminy) tminy = t1.y; if (t1.y > tmaxy) tmaxy = t1.y;
-        if (t2.x < tminx) tminx = t2.x; if (t2.x > tmaxx) tmaxx = t2.x;
-        if (t2.y < tminy) tminy = t2.y; if (t2.y > tmaxy) tmaxy = t2.y;
-        if (t3.x < tminx) tminx = t3.x; if (t3.x > tmaxx) tmaxx = t3.x;
-        if (t3.y < tminy) tminy = t3.y; if (t3.y > tmaxy) tmaxy = t3.y;
+        rect_obj = pdf_dict_get(annot, "Rect");
+        if (rect_obj == NULL || rect_obj->type != PDF_ARRAY || rect_obj->u.arr.count != 4)
+            continue;
 
-        sx = ((tmaxx - tminx) > 1e-6) ? (f->rect.x1 - f->rect.x0) / (tmaxx - tminx) : 1.0;
-        sy = ((tmaxy - tminy) > 1e-6) ? (f->rect.y1 - f->rect.y0) / (tmaxy - tminy) : 1.0;
+        rx0 = pdf_obj_num(rect_obj->u.arr.items[0], 0.0);
+        ry0 = pdf_obj_num(rect_obj->u.arr.items[1], 0.0);
+        rx1 = pdf_obj_num(rect_obj->u.arr.items[2], 0.0);
+        ry1 = pdf_obj_num(rect_obj->u.arr.items[3], 0.0);
+        rect.x0 = (rx0 < rx1) ? rx0 : rx1;
+        rect.x1 = (rx0 < rx1) ? rx1 : rx0;
+        rect.y0 = (ry0 < ry1) ? ry0 : ry1;
+        rect.y1 = (ry0 < ry1) ? ry1 : ry0;
 
-        a_mat.a = sx; a_mat.b = 0.0; a_mat.c = 0.0; a_mat.d = sy;
-        a_mat.e = f->rect.x0 - tminx * sx;
-        a_mat.f = f->rect.y0 - tminy * sy;
-
-        /* Gstate "limpio" en el tope del stack para ESTA anotacion --
-         * nunca hereda nada de la anotacion anterior ni del final del
-         * content stream de la pagina. */
-        dev->gstate_top = 0;
-        gs = cur_gstate(dev);
-        reset_gstate_default(gs, dev->bitmap->width, dev->bitmap->height);
-        gs->ctm = a_mat;
-        pdf_bitmap_set_clip(dev->bitmap, gs->clip_x0, gs->clip_y0, gs->clip_x1, gs->clip_y1);
-        pdf_bitmap_set_clip_mask(dev->bitmap, NULL, 0);
-
-        draw_form_xobject(dev, appearance);
+        draw_annot_appearance(dev, annot, rect);
     }
 }

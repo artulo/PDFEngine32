@@ -5,14 +5,22 @@
  * REAL encontrado en PDFs de uso comun (confirmado inspeccionando el
  * codestream de Conveyor_Handbook.pdf a mano): contenedor JP2 (boxes)
  * o codestream J2K crudo, un tile o varios, transformada wavelet 9/7
- * irreversible O 5/3 reversible, MCT (ICT/RCT), UNA capa de calidad,
- * code-blocks sin estilos especiales (sin BYPASS/RESET/TERMALL/etc.).
+ * irreversible O 5/3 reversible, MCT (ICT/RCT), progresion LRCP o
+ * RLCP, MULTIPLES capas de calidad (progressive-by-quality -- ver
+ * DESIGN.md, bug real con un PDF de 5-6 capas por imagen: "checkerboard"
+ * de bloques de colores en vez del contenido real, arreglado sumando
+ * dos fixes juntos: (1) los code-blocks se decodifican UNA sola vez,
+ * con los bytes de TODAS sus capas ya concatenados -- el MQ-decoder no
+ * es resumible entre llamadas, y (2) el orden de recorrido de paquetes
+ * ahora depende de cod->prog_order de verdad en vez de asumir siempre
+ * LRCP), code-blocks sin estilos especiales (sin BYPASS/RESET/TERMALL/
+ * etc.).
  *
  * NO soportado (fuera de alcance, se detecta y devuelve
  * PDF_ERR_UNSUPPORTED en vez de fallar silenciosamente o crashear):
- * multiples capas de calidad (progressive-by-quality), Region of
- * Interest (RGN), estilos de code-block especiales, componentes con
- * submuestreo de croma (xr/yr != 1), mas de 4 componentes.
+ * progresiones PCRL/CPRL, Region of Interest (RGN), estilos de
+ * code-block especiales, componentes con submuestreo de croma
+ * (xr/yr != 1), mas de 4 componentes.
  */
 
 #ifndef PDF_JPX_H

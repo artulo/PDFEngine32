@@ -88,6 +88,18 @@ int pdf_page_get_content(pdf_stream *st, const pdf_xref_table *xref,
 pdf_obj *pdf_document_get_page(pdf_stream *st, const pdf_xref_table *xref,
                                 pdf_arena *arena, int page_index);
 
+/* Igual que pdf_document_get_page(), pero ademas entrega en '*out_obj_num'
+ * el numero de objeto REAL de la pagina encontrada (-1 si no se encontro
+ * o 'out_obj_num' es NULL al llamar y no aplica) -- necesario para poder
+ * marcar la pagina como "tocada" al escribir un /Annots nuevo (ver
+ * pdf_write.h): un PDF_DICT (a diferencia de PDF_STREAM) no guarda su
+ * propio obj_num/obj_gen en el struct pdf_obj, asi que no hay otra forma
+ * de recuperarlo a partir del puntero ya resuelto. pdf_document_get_page()
+ * es un wrapper fino de esta funcion con out_obj_num=NULL. */
+pdf_obj *pdf_document_get_page_ex(pdf_stream *st, const pdf_xref_table *xref,
+                                   pdf_arena *arena, int page_index,
+                                   long *out_obj_num);
+
 /* Devuelve un atributo heredable de la pagina siguiendo el Page Tree hacia
  * sus ancestros. Si la pagina tiene la clave, gana la definicion local;
  * si no, se busca el nodo /Pages padre mas cercano.

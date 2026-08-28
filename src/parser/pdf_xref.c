@@ -368,18 +368,37 @@ static int pdf_xref_load_stream_section(pdf_stream *st, pdf_arena *arena,
                 if (objnum >= 0 && objnum < xref->count &&
                     xref->entries[objnum].offset == -1 && !xref->entries[objnum].compressed)
                 {
+                    /* BUG REAL ENCONTRADO (misma familia que el comentario
+                     * grande de pdf_xref_init_entries, arriba, y que
+                     * project_bcc32_field_write_bug_widespread en la
+                     * memoria del proyecto): estas dos ramas escribian
+                     * campos ADYACENTES de 'pdf_xref_entry' con asignacion
+                     * directa consecutiva -- el patron exacto que bcc32
+                     * 7.70 miscompila. Confirmado como causa raiz de un
+                     * bug real: en un PDF con objetos comprimidos (ObjStm),
+                     * 'objstm_index' (o 'objstm_num') podia quedar
+                     * corrompido para entradas puntuales, haciendo que
+                     * pdf_load_from_objstm() extrajera el objeto EQUIVOCADO
+                     * dentro del ObjStm correcto -- sintoma observado:
+                     * anchos de fuente (/Widths) con valores y longitud de
+                     * array incorrectos para fuentes especificas, mientras
+                     * otras fuentes del mismo documento (resueltas desde
+                     * objetos NO comprimidos) parseaban bien. Mismo fix ya
+                     * establecido en todo este archivo: memcpy() desde
+                     * variables locales en vez de escritura directa. */
+                    int one_i = 1;
                     if (f0 == 1)
                     {
-                        xref->entries[objnum].offset = f1;
-                        xref->entries[objnum].gen    = f2;
-                        xref->entries[objnum].in_use = 1;
+                        memcpy(&xref->entries[objnum].offset, &f1, sizeof(f1));
+                        memcpy(&xref->entries[objnum].gen, &f2, sizeof(f2));
+                        memcpy(&xref->entries[objnum].in_use, &one_i, sizeof(one_i));
                     }
                     else if (f0 == 2)
                     {
-                        xref->entries[objnum].compressed   = 1;
-                        xref->entries[objnum].objstm_num   = f1;
-                        xref->entries[objnum].objstm_index = f2;
-                        xref->entries[objnum].in_use       = 1;
+                        memcpy(&xref->entries[objnum].compressed, &one_i, sizeof(one_i));
+                        memcpy(&xref->entries[objnum].objstm_num, &f1, sizeof(f1));
+                        memcpy(&xref->entries[objnum].objstm_index, &f2, sizeof(f2));
+                        memcpy(&xref->entries[objnum].in_use, &one_i, sizeof(one_i));
                     }
                     /* f0 == 0: entrada libre, no hacer nada (offset queda -1) */
                 }
