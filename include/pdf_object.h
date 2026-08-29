@@ -104,6 +104,16 @@ pdf_obj *pdf_obj_new_synthetic_stream(pdf_arena *arena, pdf_obj *dict_obj,
 /* Agrega un item a un array (PDF_ARRAY). Devuelve PDF_OK o un codigo de error. */
 int pdf_array_push(pdf_arena *arena, pdf_obj *array_obj, pdf_obj *item);
 
+/* Elimina el item en 'index' (0-based) de un array (PDF_ARRAY),
+ * corriendo los items siguientes un lugar hacia atras y decrementando
+ * 'count' -- ver DESIGN.md (fase "borrar resaltado"). No hace falta
+ * arena (nunca alloca, solo compacta 'items' en el lugar -- el item
+ * quitado simplemente queda sin referenciar, se recicla con el resto
+ * de la arena al cerrar el documento, mismo criterio tolerante que el
+ * resto del motor). Devuelve PDF_OK, o PDF_ERR_BADARG si 'array_obj'
+ * no es un array o 'index' esta fuera de rango. */
+int pdf_array_remove_at(pdf_obj *array_obj, int index);
+
 /* Setea key->val en un dict (PDF_DICT o PDF_STREAM). Copia 'key' a la
  * arena. Devuelve PDF_OK o un codigo de error. */
 int pdf_dict_set(pdf_arena *arena, pdf_obj *obj, const char *key, pdf_obj *val);

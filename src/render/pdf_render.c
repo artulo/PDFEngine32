@@ -2438,3 +2438,117 @@ void pdf_render_draw_highlight_annotations(pdf_render_device *dev, pdf_obj *page
         draw_annot_appearance(dev, annot, rect);
     }
 }
+
+/* Igual que las 2 funciones de arriba (mismo scan de /Annots), pero
+ * filtrando /Subtype /FreeText (globo de tip, ver pdf_annot.h/
+ * pdf_annot.c) -- se llama DESPUES de pdf_render_draw_shape_
+ * annotations (mismo call site) para que un tip quede dibujado por
+ * encima de todo lo demas. */
+void pdf_render_draw_tip_annotations(pdf_render_device *dev, pdf_obj *page_obj)
+{
+    pdf_obj *annots;
+    int i;
+
+    if (dev == NULL || page_obj == NULL || dev->st == NULL || dev->xref == NULL ||
+        dev->arena == NULL || dev->bitmap == NULL)
+        return;
+
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+        annots = pdf_parser_load_object(dev->st, dev->xref, annots->u.ref.num, dev->arena);
+    if (annots == NULL || annots->type != PDF_ARRAY)
+        return;
+
+    for (i = 0; i < annots->u.arr.count; i++)
+    {
+        pdf_obj *annot = annots->u.arr.items[i];
+        const char *subtype;
+        pdf_obj *rect_obj;
+        pdf_rect rect;
+        double rx0, ry0, rx1, ry1;
+
+        if (annot != NULL && annot->type == PDF_REF)
+            annot = pdf_parser_load_object(dev->st, dev->xref, annot->u.ref.num, dev->arena);
+        if (annot == NULL || (annot->type != PDF_DICT && annot->type != PDF_STREAM))
+            continue;
+
+        subtype = pdf_dict_get_name(annot, "Subtype");
+        if (subtype == NULL || strcmp(subtype, "FreeText") != 0)
+            continue;
+
+        rect_obj = pdf_dict_get(annot, "Rect");
+        if (rect_obj == NULL || rect_obj->type != PDF_ARRAY || rect_obj->u.arr.count != 4)
+            continue;
+
+        rx0 = pdf_obj_num(rect_obj->u.arr.items[0], 0.0);
+        ry0 = pdf_obj_num(rect_obj->u.arr.items[1], 0.0);
+        rx1 = pdf_obj_num(rect_obj->u.arr.items[2], 0.0);
+        ry1 = pdf_obj_num(rect_obj->u.arr.items[3], 0.0);
+        rect.x0 = (rx0 < rx1) ? rx0 : rx1;
+        rect.x1 = (rx0 < rx1) ? rx1 : rx0;
+        rect.y0 = (ry0 < ry1) ? ry0 : ry1;
+        rect.y1 = (ry0 < ry1) ? ry1 : ry0;
+
+        draw_annot_appearance(dev, annot, rect);
+    }
+}
+
+/* Igual que pdf_render_draw_highlight_annotations arriba (mismo scan
+ * de /Annots byte a byte, ref-o-inline, /Rect min/max-normalizado),
+ * cambiando solo el filtro de Subtype a las 4 formas libres nuevas
+ * (ver pdf_annot.h/pdf_annot.c) -- reusa draw_annot_appearance() sin
+ * cambios, ya es generico para cualquier anotacion con /Rect+/AP. Se
+ * llama DESPUES de pdf_render_draw_highlight_annotations (mismo call
+ * site en HB_FUNC(PDF_RENDERTOHBITMAP), pdf_hbfunc.c) para que formas
+ * (flechas/circulos senalando algo) queden por encima de cualquier
+ * resaltado debajo. */
+void pdf_render_draw_shape_annotations(pdf_render_device *dev, pdf_obj *page_obj)
+{
+    pdf_obj *annots;
+    int i;
+
+    if (dev == NULL || page_obj == NULL || dev->st == NULL || dev->xref == NULL ||
+        dev->arena == NULL || dev->bitmap == NULL)
+        return;
+
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+        annots = pdf_parser_load_object(dev->st, dev->xref, annots->u.ref.num, dev->arena);
+    if (annots == NULL || annots->type != PDF_ARRAY)
+        return;
+
+    for (i = 0; i < annots->u.arr.count; i++)
+    {
+        pdf_obj *annot = annots->u.arr.items[i];
+        const char *subtype;
+        pdf_obj *rect_obj;
+        pdf_rect rect;
+        double rx0, ry0, rx1, ry1;
+
+        if (annot != NULL && annot->type == PDF_REF)
+            annot = pdf_parser_load_object(dev->st, dev->xref, annot->u.ref.num, dev->arena);
+        if (annot == NULL || (annot->type != PDF_DICT && annot->type != PDF_STREAM))
+            continue;
+
+        subtype = pdf_dict_get_name(annot, "Subtype");
+        if (subtype == NULL ||
+            (strcmp(subtype, "Line") != 0 && strcmp(subtype, "Square") != 0 &&
+             strcmp(subtype, "Circle") != 0 && strcmp(subtype, "Ink") != 0))
+            continue;
+
+        rect_obj = pdf_dict_get(annot, "Rect");
+        if (rect_obj == NULL || rect_obj->type != PDF_ARRAY || rect_obj->u.arr.count != 4)
+            continue;
+
+        rx0 = pdf_obj_num(rect_obj->u.arr.items[0], 0.0);
+        ry0 = pdf_obj_num(rect_obj->u.arr.items[1], 0.0);
+        rx1 = pdf_obj_num(rect_obj->u.arr.items[2], 0.0);
+        ry1 = pdf_obj_num(rect_obj->u.arr.items[3], 0.0);
+        rect.x0 = (rx0 < rx1) ? rx0 : rx1;
+        rect.x1 = (rx0 < rx1) ? rx1 : rx0;
+        rect.y0 = (ry0 < ry1) ? ry0 : ry1;
+        rect.y1 = (ry0 < ry1) ? ry1 : ry0;
+
+        draw_annot_appearance(dev, annot, rect);
+    }
+}

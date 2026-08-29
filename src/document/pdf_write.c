@@ -56,6 +56,107 @@ static long find_last_startxref(FILE *fp, long file_size)
 }
 
 /* ====================================================================
+ * Deteccion de PDF linealizado ("Fast Web View") -- ver comentario
+ * grande junto a detect_active_linearization() mas abajo.
+ * ==================================================================== */
+
+/* Busca el diccionario de linealizacion -- por norma (ISO 32000-1
+ * Anexo F.2) es SIEMPRE el primer objeto indirecto fisico del
+ * archivo, justo despues de la linea de cabecera "%PDF-M.N" y de
+ * cualquier linea de comentario binario que la siga (empieza con '%',
+ * convencion estandar para marcar el archivo binary-safe). No hace
+ * falta buscarlo por numero de objeto -- se identifica por POSICION,
+ * exactamente como lo hace cualquier lector conforme.
+ *
+ * BUG REAL ENCONTRADO (Arturo: "no me permite abrir el pdf en
+ * acrobat" -- error real de Adobe Acrobat Reader, "Problema al leer
+ * el documento (14)"): un PDF linealizado declara en este diccionario
+ * /L = tamano TOTAL del archivo en el momento en que se linealizo.
+ * pdf_write_incremental_update() NUNCA toca los bytes originales (esa
+ * es la gracia de una actualizacion incremental) -- asi que ese /L
+ * queda desactualizado para siempre en cuanto se agrega la PRIMERA
+ * anotacion/campo de formulario y se guarda. Herramientas tolerantes
+ * (pypdf, qpdf, MuPDF -- las 3 probadas explicitamente) ignoran el /L
+ * viejo sin problema y siguen leyendo el archivo bien. Adobe Acrobat
+ * Reader real, en la practica, NO: un PDF linealizado con una sola
+ * actualizacion incremental encima (exactamente el resultado de
+ * CUALQUIER "Guardar" de este motor) dejaba de poder abrirse.
+ * Confirmado reproduciendo el escenario exacto contra un PDF real
+ * (tests/hot corrocion.pdf, linealizado de origen) y comparando
+ * contra una reescritura limpia via qpdf (que SI abrio bien en
+ * Acrobat, aislando el problema a la linealizacion stale y no a
+ * ninguna otra parte de la sintaxis -- confirmado por Arturo
+ * directamente contra Acrobat real).
+ *
+ * Devuelve 1 si encontro un diccionario de linealizacion TODAVIA
+ * activo (con la clave /Linearized presente en su valor YA RESUELTO
+ * -- se consulta a traves de pdf_xref_load_object(), que devuelve la
+ * version cacheada/mutada si un guardado anterior en esta misma
+ * sesion ya lo neutralizo, para no volver a tocarlo en cada guardado
+ * sucesivo) y llena '*out_num'/'*out_gen'. Devuelve 0 si el archivo no
+ * es un PDF linealizado, o si ya fue neutralizado antes. */
+static int detect_active_linearization(pdf_stream *st, const pdf_xref_table *xref,
+                                        pdf_arena *arena, long *out_num, long *out_gen)
+{
+    char buf[512];
+    long got, i;
+    long num, gen;
+    pdf_obj *resolved;
+
+    if (st == NULL || st->fp == NULL || xref == NULL || out_num == NULL || out_gen == NULL)
+        return 0;
+
+    fseek(st->fp, 0, SEEK_SET);
+    got = (long)fread(buf, 1, sizeof(buf) - 1, st->fp);
+    if (got <= 0)
+        return 0;
+    buf[got] = 0;
+
+    /* Saltar "%PDF-M.N" (hasta el primer fin de linea), despues
+     * cualquier cantidad de lineas que empiecen con '%' (comentarios,
+     * incluido el marcador binario de 4 bytes altos que casi todo
+     * generador agrega justo despues de la cabecera). */
+    i = 0;
+    while (i < got && buf[i] != '\n' && buf[i] != '\r') i++;
+    for (;;)
+    {
+        while (i < got && (buf[i] == '\n' || buf[i] == '\r' || buf[i] == ' ' || buf[i] == '\t'))
+            i++;
+        if (i < got && buf[i] == '%')
+        {
+            while (i < got && buf[i] != '\n' && buf[i] != '\r') i++;
+            continue;
+        }
+        break;
+    }
+
+    /* Parsear "NUM GEN obj" a mano -- sin sscanf, mismo estilo tolerante
+     * que el resto del parser de este motor. */
+    if (i >= got || buf[i] < '0' || buf[i] > '9')
+        return 0;
+    num = 0;
+    while (i < got && buf[i] >= '0' && buf[i] <= '9') { num = num * 10 + (buf[i] - '0'); i++; }
+    while (i < got && buf[i] == ' ') i++;
+    if (i >= got || buf[i] < '0' || buf[i] > '9')
+        return 0;
+    gen = 0;
+    while (i < got && buf[i] >= '0' && buf[i] <= '9') { gen = gen * 10 + (buf[i] - '0'); i++; }
+    while (i < got && buf[i] == ' ') i++;
+    if (i + 3 > got || buf[i] != 'o' || buf[i + 1] != 'b' || buf[i + 2] != 'j')
+        return 0;
+
+    resolved = pdf_xref_load_object(st, xref, num, arena);
+    if (resolved == NULL || resolved->type != PDF_DICT)
+        return 0;
+    if (pdf_dict_get(resolved, "Linearized") == NULL)
+        return 0;
+
+    *out_num = num;
+    *out_gen = gen;
+    return 1;
+}
+
+/* ====================================================================
  * Serializacion generica pdf_obj -> sintaxis PDF
  * ==================================================================== */
 
@@ -234,8 +335,11 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
     long remaining;
     int i;
     pdf_obj *root_ref, *id_arr;
-
-    (void)arena; /* xref_offsets usa un buffer local fijo -- ver abajo */
+    pdf_obj **eff_touched_objs;
+    const long *eff_touched_nums;
+    const long *eff_touched_gens;
+    int eff_n_touched;
+    long lin_num, lin_gen;
 
     if (st == NULL || st->fp == NULL || xref == NULL || out_path == NULL ||
         touched_objs == NULL || touched_nums == NULL || touched_gens == NULL ||
@@ -253,6 +357,51 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
     prev_xref_offset = find_last_startxref(in_fp, file_size);
     if (prev_xref_offset < 0)
         return PDF_ERR_BADARG; /* no se pudo determinar el xref original -- no seguir a ciegas */
+
+    /* PDF linealizado con /L (tamano de archivo) desactualizado por la
+     * actualizacion incremental que esta funcion esta a punto de
+     * escribir -- ver el comentario grande junto a
+     * detect_active_linearization() mas arriba (bug real: Acrobat
+     * rechazaba abrir el resultado, "Problema al leer el documento
+     * (14)", aunque pypdf/qpdf/MuPDF lo leian bien). Si se detecta, se
+     * agrega el diccionario de linealizacion a la lista de tocados con
+     * un reemplazo vacio -- un slot mas alla de lo que goto el
+     * llamador, por eso se arman arrays LOCALES (en 'arena') en vez de
+     * escribir sobre los del llamador. Si 'arena' fallara la
+     * alocacion, o si ya no queda lugar (n_touched al tope de 4096,
+     * practicamente imposible en el uso real), se seguia igual con la
+     * lista original SIN neutralizar -- mejor guardar sin arreglar la
+     * linealizacion que no guardar nada. */
+    eff_touched_objs = touched_objs;
+    eff_touched_nums = touched_nums;
+    eff_touched_gens = touched_gens;
+    eff_n_touched = n_touched;
+
+    if (arena != NULL && n_touched < 4096 &&
+        detect_active_linearization(st, xref, arena, &lin_num, &lin_gen))
+    {
+        pdf_obj **new_objs = (pdf_obj **)pdf_arena_alloc(arena, sizeof(pdf_obj *) * (size_t)(n_touched + 1));
+        long *new_nums = (long *)pdf_arena_alloc(arena, sizeof(long) * (size_t)(n_touched + 1));
+        long *new_gens = (long *)pdf_arena_alloc(arena, sizeof(long) * (size_t)(n_touched + 1));
+        if (new_objs != NULL && new_nums != NULL && new_gens != NULL)
+        {
+            int k;
+            for (k = 0; k < n_touched; k++)
+            {
+                new_objs[k] = touched_objs[k];
+                new_nums[k] = touched_nums[k];
+                new_gens[k] = touched_gens[k];
+            }
+            new_objs[n_touched] = pdf_obj_new_dict(arena);
+            new_nums[n_touched] = lin_num;
+            new_gens[n_touched] = lin_gen;
+
+            eff_touched_objs = new_objs;
+            eff_touched_nums = new_nums;
+            eff_touched_gens = new_gens;
+            eff_n_touched = n_touched + 1;
+        }
+    }
 
     sprintf(tmp_path, "%s.pdftmp", out_path);
     sprintf(bak_path, "%s.bak", out_path);
@@ -275,18 +424,20 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
     fprintf(out_fp, "\n"); /* separador defensivo, por si el original no terminaba en salto de linea */
 
     /* 2) objetos tocados, guardando offset para la tabla xref nueva.
-     * Buffer fijo (no arena) -- n_touched ya esta acotado arriba a un
-     * numero chico (PDF_HB_MAX_TOUCHED_OBJS en pdf_hbfunc.c es 128). */
+     * Buffer fijo (no arena) -- eff_n_touched esta acotado a 4096
+     * arriba (PDF_HB_MAX_TOUCHED_OBJS en pdf_hbfunc.c es 128 para los
+     * llamadores reales; +1 por la neutralizacion de linealizacion,
+     * ver arriba). */
     {
-        long offsets_buf[4096];
+        long offsets_buf[4096 + 1];
 
         size_val = xref->count;
-        for (i = 0; i < n_touched; i++)
+        for (i = 0; i < eff_n_touched; i++)
         {
             offsets_buf[i] = ftell(out_fp);
-            write_indirect_object(out_fp, touched_objs[i], touched_nums[i], touched_gens[i]);
-            if (touched_nums[i] + 1 > size_val)
-                size_val = touched_nums[i] + 1;
+            write_indirect_object(out_fp, eff_touched_objs[i], eff_touched_nums[i], eff_touched_gens[i]);
+            if (eff_touched_nums[i] + 1 > size_val)
+                size_val = eff_touched_nums[i] + 1;
         }
 
         /* 3) tabla xref clasica -- solo los objetos tocados (una
@@ -295,10 +446,10 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
          * el numero de campos editados de una vez es chico). */
         new_xref_start = ftell(out_fp);
         fprintf(out_fp, "xref\n");
-        for (i = 0; i < n_touched; i++)
+        for (i = 0; i < eff_n_touched; i++)
         {
-            fprintf(out_fp, "%ld 1\n", touched_nums[i]);
-            fprintf(out_fp, "%010ld %05ld n \n", offsets_buf[i], touched_gens[i]);
+            fprintf(out_fp, "%ld 1\n", eff_touched_nums[i]);
+            fprintf(out_fp, "%010ld %05ld n \n", offsets_buf[i], eff_touched_gens[i]);
         }
     }
 
@@ -324,6 +475,33 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
 
     fclose(out_fp);
 
+    /* BUG REAL ENCONTRADO Y ARREGLADO (Arturo: "Guardar dice que no hay
+     * cambios pendientes" pese a que 'h->n_touched' era 2 y el
+     * documento no estaba encriptado -- confirmado leyendo el codigo Y
+     * reproducido con un harness aislado: pdf_write_incremental_update
+     * devolvia PDF_ERR_IO al escribir sobre el MISMO archivo que 'st'
+     * todavia tenia ABIERTO para lectura, exactamente el caso real de
+     * "Guardar" -- el documento sigue abierto para mostrarse en pantalla
+     * mientras se intenta sobrescribir 'out_path'). En Windows, ni
+     * siquiera el mismo proceso puede renombrar/reemplazar un archivo
+     * que tiene un handle abierto via fopen() sin FILE_SHARE_DELETE --
+     * los dos rename() de abajo fallaban SIEMPRE en este escenario,
+     * silenciosamente (el primero se ignora a proposito, el segundo
+     * devolvia PDF_ERR_IO). Fix: cerrar el handle de lectura de 'st'
+     * ANTES de la danza de renames (ya se termino de leer todo lo que
+     * hacia falta del original, arriba) y volver a abrirlo AL FINAL,
+     * apuntando a donde haya terminado el archivo (el nuevo contenido
+     * si todo salio bien, o el original restaurado si algo fallo) --
+     * reusa pdf_stream_open() tal cual, ya probado, en vez de reimplementar
+     * a mano el reset de buffer/tamanio de 'st'. El llamador (Pdf_FormSave)
+     * sigue usando el MISMO 'st' con normalidad despues de este llamado
+     * (el documento sigue abierto para seguir viendolo/navegandolo). */
+    fclose(in_fp);
+    {
+        FILE *null_fp = NULL;
+        memcpy(&st->fp, &null_fp, sizeof(null_fp));
+    }
+
     /* 5) reemplazo seguro: el original pasa a .bak (nunca se borra) ANTES
      * de mover el temporal a su lugar -- si el ultimo rename() falla,
      * se intenta recuperar el original desde el .bak automaticamente. */
@@ -343,8 +521,10 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
          * lugar para no dejar a Arturo sin el archivo ni el guardado. */
         rename(bak_path, out_path);
         remove(tmp_path);
+        pdf_stream_open(st, out_path); /* reabrir 'st' pase lo que pase -- ver comentario grande arriba */
         return PDF_ERR_IO;
     }
 
+    pdf_stream_open(st, out_path); /* reabrir 'st' apuntando al archivo nuevo -- ver comentario grande arriba */
     return PDF_OK;
 }

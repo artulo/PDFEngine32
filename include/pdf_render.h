@@ -427,6 +427,19 @@ void pdf_render_draw_annotations(pdf_render_device *dev, pdf_obj *page_obj);
  * stream de la pagina). */
 void pdf_render_draw_highlight_annotations(pdf_render_device *dev, pdf_obj *page_obj);
 
+/* Igual que arriba, pero para las 4 formas libres nuevas (/Line,
+ * /Square, /Circle, /Ink -- ver pdf_annot.h/pdf_annot.c). Llamar
+ * inmediatamente despues de pdf_render_draw_highlight_annotations
+ * (mismo call site) para que queden dibujadas por encima de cualquier
+ * resaltado debajo. */
+void pdf_render_draw_shape_annotations(pdf_render_device *dev, pdf_obj *page_obj);
+
+/* Igual que arriba, pero para el globo de tip (/FreeText -- ver
+ * pdf_annot.h/pdf_annot.c). Llamar inmediatamente despues de
+ * pdf_render_draw_shape_annotations (mismo call site) para que un tip
+ * quede dibujado por encima de todo lo demas. */
+void pdf_render_draw_tip_annotations(pdf_render_device *dev, pdf_obj *page_obj);
+
 /* Ver comentario grande junto a la implementacion, pdf_render.c --
  * convierte un punto del espacio "topdown" que usa la extraccion de
  * texto/seleccion (pdf_text_extract_page(), aSelRanges en

@@ -185,6 +185,21 @@ static pdf_font *hb_doc_font_cache_fn(void *user, pdf_obj *fdict,
     return font;
 }
 
+/* BUG REAL ENCONTRADO (fase de resaltado de texto -- Arturo: "Guardar
+ * dice que no hay cambios pendientes" pese a que el resaltado SI se
+ * veia en pantalla, osea SI se habia mutado 'page_obj'/'annots' bien):
+ * esta funcion ya tenia el patron EXACTO de la miscompilacion de bcc32
+ * 7.70 documentada extensamente en este proyecto (ver DESIGN.md,
+ * pdf_xref.c/pdf_object.c/pdf_render.c) -- 3 escrituras DIRECTAS
+ * consecutivas a campos ADYACENTES de un struct (`h->touched[...]
+ * .obj_num/.obj_gen/.obj_ptr`) seguidas de un incremento
+ * (`h->n_touched++`). Era codigo YA EXISTENTE de la fase de AcroForm,
+ * nunca antes disparado de forma detectable -- el resaltado de texto
+ * parece haber sido el primer camino que lo hizo manifestarse de forma
+ * reproducible (probablemente por la asignacion de registros/orden de
+ * evaluacion particular que genera esta nueva secuencia de llamadas).
+ * Mismo fix ya establecido en todo el resto del motor: memcpy() desde
+ * variables locales en vez de asignacion directa a campos adyacentes. */
 static void mark_touched(pdf_hb_doc *h, long obj_num, long obj_gen, pdf_obj *obj_ptr)
 {
     int i;
@@ -192,15 +207,17 @@ static void mark_touched(pdf_hb_doc *h, long obj_num, long obj_gen, pdf_obj *obj
     for (i = 0; i < h->n_touched; i++)
         if (h->touched[i].obj_num == obj_num)
         {
-            h->touched[i].obj_ptr = obj_ptr; /* refrescar -- re-editar el mismo campo */
+            memcpy(&h->touched[i].obj_ptr, &obj_ptr, sizeof(obj_ptr)); /* refrescar -- re-editar el mismo campo */
             return;
         }
     if (h->n_touched < PDF_HB_MAX_TOUCHED_OBJS)
     {
-        h->touched[h->n_touched].obj_num = obj_num;
-        h->touched[h->n_touched].obj_gen = obj_gen;
-        h->touched[h->n_touched].obj_ptr = obj_ptr;
-        h->n_touched++;
+        int idx = h->n_touched;
+        int new_count = h->n_touched + 1;
+        memcpy(&h->touched[idx].obj_num, &obj_num, sizeof(obj_num));
+        memcpy(&h->touched[idx].obj_gen, &obj_gen, sizeof(obj_gen));
+        memcpy(&h->touched[idx].obj_ptr, &obj_ptr, sizeof(obj_ptr));
+        memcpy(&h->n_touched, &new_count, sizeof(new_count));
     }
 }
 
@@ -1507,6 +1524,18 @@ HB_FUNC(PDF_RENDERTOHBITMAP)
          * como cualquier /Highlight preexistente en el archivo. */
         pdf_render_draw_highlight_annotations(&dev, page_obj);
 
+        /* Formas libres (/Line, /Square, /Circle, /Ink -- ver
+         * HB_FUNC(PDF_ANNOTADDSHAPE) mas abajo) -- DESPUES del
+         * resaltado, para que queden dibujadas por encima (una flecha
+         * o circulo senalando algo se ve mejor arriba de un resaltado
+         * debajo, no tapado por el). */
+        pdf_render_draw_shape_annotations(&dev, page_obj);
+
+        /* Globo de tip (/Subtype /FreeText -- ver HB_FUNC(PDF_ANNOTADDTIP)
+         * mas abajo) -- DESPUES de todo lo demas, para que quede
+         * dibujado por encima de todo. */
+        pdf_render_draw_tip_annotations(&dev, page_obj);
+
         if (gdi_ok)
             pdf_gdi_text_ctx_destroy(&gdi_text);
     }
@@ -2285,7 +2314,7 @@ HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
     int n_quads;
     double quads[PDF_ANNOT_MAX_QUADS * 8];
     double bbox[4];
-    long ap_num, annot_num;
+    long ap_num;
     pdf_obj *ap_obj, *annot_obj;
     pdf_obj *annots;
 
@@ -2440,8 +2469,36 @@ HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
         return;
     }
 
+    /* BUG REAL ENCONTRADO Y ARREGLADO (Arturo: "resaltar no marca
+     * nada"): la primera version de esta funcion armaba un numero de
+     * objeto nuevo TAMBIEN para el dict de la anotacion (`annot_num`) y
+     * lo agregaba a /Annots como `pdf_obj_new_ref(annot_num, 0)` -- una
+     * referencia SIMBOLICA por numero. El problema: `annot_num` es
+     * sintetico, recien inventado en ESTA sesion, y NUNCA existio en la
+     * tabla xref del archivo (`xref->count` es el limite real, y
+     * `annot_num` siempre cae por encima) -- asi que apenas se
+     * necesitaba volver a RESOLVER esa referencia (exactamente lo que
+     * hace pdf_render_draw_highlight_annotations en cada render), la
+     * resolucion fallaba en silencio (num >= xref->count) y la
+     * anotacion nunca aparecia, aunque el guardado a archivo si la
+     * hubiera escrito bien (recien ahi 'annot_num' pasa a ser un numero
+     * REAL, con su propia entrada de xref -- por eso el primer test de
+     * esta sesion, que renderizaba DESPUES de guardar y reabrir,
+     * "funcionaba" sin mostrar el bug).
+     *
+     * Fix: NO envolver la anotacion en una referencia -- empujar el
+     * PUNTERO DIRECTO del dict al array /Annots, mismo truco YA usado
+     * para /AP/N (ver pdf_annot_new_highlight: 'ap_stream_obj' se
+     * guarda directo, sin pdf_obj_new_ref, porque pdf_write.c ya sabe
+     * emitir un valor PDF_STREAM como "N G R" automaticamente). Un
+     * PDF_DICT como item de array, en cambio, se serializa INLINE (no
+     * como referencia) -- asi que la anotacion queda embebida dentro de
+     * /Annots tanto en memoria COMO en el archivo guardado; nada
+     * necesita resolverla por numero nunca, ni antes ni despues de
+     * guardar. Solo la apariencia (`ap_obj`, un STREAM -- los streams
+     * SI necesitan su propio numero de objeto, nunca se embeben
+     * inline) sigue necesitando `mark_touched`. */
     ap_num = h->next_new_obj_num++;
-    annot_num = h->next_new_obj_num++;
 
     ap_obj = pdf_annot_generate_highlight_appearance(&h->doc.doc_arena, quads, n_quads,
                                                        1.0, 1.0, 0.0, 0.4, ap_num, bbox);
@@ -2475,7 +2532,7 @@ HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
             hb_retl(HB_FALSE);
             return;
         }
-        if (pdf_array_push(&h->doc.doc_arena, annots, pdf_obj_new_ref(&h->doc.doc_arena, annot_num, 0)) != PDF_OK)
+        if (pdf_array_push(&h->doc.doc_arena, annots, annot_obj) != PDF_OK)
         {
             hb_retl(HB_FALSE);
             return;
@@ -2492,7 +2549,7 @@ HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
             annots = pdf_obj_new_array(&h->doc.doc_arena, 4);
             pdf_dict_set(&h->doc.doc_arena, page_obj, "Annots", annots);
         }
-        if (pdf_array_push(&h->doc.doc_arena, annots, pdf_obj_new_ref(&h->doc.doc_arena, annot_num, 0)) != PDF_OK)
+        if (pdf_array_push(&h->doc.doc_arena, annots, annot_obj) != PDF_OK)
         {
             hb_retl(HB_FALSE);
             return;
@@ -2502,7 +2559,1150 @@ HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
     }
 
     mark_touched(h, ap_num, 0, ap_obj);
-    mark_touched(h, annot_num, 0, annot_obj);
+
+    hb_retl(HB_TRUE);
+}
+
+/* Pdf_AnnotAddShape( pDoc, nPagina, cTipo, aPuntos ) -> lReturn
+ *     Agrega una forma libre nueva: cTipo = "LINE"|"RECT"|"CIRCLE"|"INK".
+ *     'aPuntos' es un array de {x,y} en el MISMO formato "topdown"
+ *     local a la pagina que usa Pdf_AnnotAddHighlight (columnas 4-7 de
+ *     TPdfBitmap:aSelRanges / lo que devuelve BmpToPagePoint en
+ *     pdf_viewer.prg) -- LINE/RECT/CIRCLE exigen EXACTAMENTE 2 puntos
+ *     (las 2 esquinas arrastradas; para LINE el orden importa: el
+ *     primero es el inicio, el segundo es donde va la punta de flecha);
+ *     INK acepta de 2 a PDF_ANNOT_MAX_INK_POINTS puntos (el trazo
+ *     completo acumulado durante el arrastre).
+ *
+ *     Una sola funcion con parametro de tipo (no 4 separadas) porque la
+ *     forma de los parametros es genuinamente uniforme entre los 4
+ *     tipos -- mismo criterio que ya usa Pdf_FormSetFieldValue (un solo
+ *     binding, dispatch interno) en vez de funciones separadas por
+ *     tipo.
+ *
+ *     Mismas guardas y mismo mecanismo "touched objects" que
+ *     Pdf_AnnotAddHighlight (ver comentario grande arriba) -- solo muta
+ *     el documento EN MEMORIA, hace falta Pdf_FormSave() despues para
+ *     persistir. Color/ancho fijos en esta primera version: rojo
+ *     (0.8,0,0), 2pt de trazo -- distinto del amarillo de resaltado
+ *     para que se distingan a simple vista, sin selector todavia. */
+HB_FUNC(PDF_ANNOTADDSHAPE)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    const char *type_str = hb_parc(3);
+    PHB_ITEM aPoints = hb_param(4, HB_IT_ARRAY);
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj;
+    long page_obj_num = -1;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+    HB_SIZE n_points_hb, pi;
+    double native_pts[PDF_ANNOT_MAX_INK_POINTS * 2];
+    int n_points;
+    int shape_type; /* 0=LINE 1=RECT 2=CIRCLE 3=INK */
+    double bbox[4];
+    long ap_num;
+    pdf_obj *ap_obj, *annot_obj;
+    pdf_obj *annots;
+
+    if (h == NULL || !h->open || page_index < 0 || type_str == NULL || aPoints == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    if (strcmp(type_str, "LINE") == 0) shape_type = 0;
+    else if (strcmp(type_str, "RECT") == 0) shape_type = 1;
+    else if (strcmp(type_str, "CIRCLE") == 0) shape_type = 2;
+    else if (strcmp(type_str, "INK") == 0) shape_type = 3;
+    else
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Mismas guardas que Pdf_AnnotAddHighlight -- ver el comentario
+     * grande junto a esa funcion. */
+    if (h->xref.crypt.active)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->xref.resolved == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->n_touched + 3 > PDF_HB_MAX_TOUCHED_OBJS)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    n_points_hb = hb_arrayLen(aPoints);
+    if (shape_type != 3 && n_points_hb != 2)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (shape_type == 3 && (n_points_hb < 2 || n_points_hb > (HB_SIZE)PDF_ANNOT_MAX_INK_POINTS))
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    page_obj = pdf_document_get_page_ex(&h->st, &h->xref, &h->doc.doc_arena, page_index, &page_obj_num);
+    if (page_obj == NULL || page_obj_num <= 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
+     * calculo que PDF_GETPAGESIZEPT/PDF_RENDERTOHBITMAP/
+     * pdf_text_extract_page/Pdf_AnnotAddHighlight (5 copias del mismo
+     * bloque en el motor antes de esta, cada una con este comentario
+     * cruzado -- si se corrige un bug aca corregirlo en las otras 5
+     * tambien). */
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+
+    /* Cada punto de 'aPoints' (topdown local) -> espacio nativo. */
+    n_points = 0;
+    for (pi = 1; pi <= n_points_hb; pi++)
+    {
+        PHB_ITEM aRow = hb_arrayGetItemPtr(aPoints, pi);
+        double tx, ty, nx, ny;
+
+        if (aRow == NULL || !HB_IS_ARRAY(aRow) || hb_arrayLen(aRow) < 2)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        tx = hb_arrayGetND(aRow, 1);
+        ty = hb_arrayGetND(aRow, 2);
+        if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h,
+                                           tx, ty, &nx, &ny))
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        native_pts[n_points * 2] = nx;
+        native_pts[n_points * 2 + 1] = ny;
+        n_points++;
+    }
+
+    ap_num = h->next_new_obj_num++;
+
+    switch (shape_type)
+    {
+    case 0: /* LINE -- el orden de los 2 puntos importa (flecha en el 2do) */
+        ap_obj = pdf_annot_generate_line_appearance(&h->doc.doc_arena,
+            native_pts[0], native_pts[1], native_pts[2], native_pts[3],
+            0.8, 0.0, 0.0, 2.0, ap_num, bbox);
+        if (ap_obj == NULL)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        annot_obj = pdf_annot_new_line(&h->doc.doc_arena, bbox,
+            native_pts[0], native_pts[1], native_pts[2], native_pts[3],
+            0.8, 0.0, 0.0, ap_obj);
+        break;
+
+    case 1: /* RECT */
+    case 2: /* CIRCLE */
+        {
+            double x0 = (native_pts[0] < native_pts[2]) ? native_pts[0] : native_pts[2];
+            double x1 = (native_pts[0] < native_pts[2]) ? native_pts[2] : native_pts[0];
+            double y0 = (native_pts[1] < native_pts[3]) ? native_pts[1] : native_pts[3];
+            double y1 = (native_pts[1] < native_pts[3]) ? native_pts[3] : native_pts[1];
+
+            /* Guarda de tamano degenerado -- defensa en profundidad
+             * ademas del guard de pixeles del lado UI (pdf_viewer.prg,
+             * LButtonUp). */
+            if (x1 - x0 < 0.5 || y1 - y0 < 0.5)
+            {
+                hb_retl(HB_FALSE);
+                return;
+            }
+            if (shape_type == 1)
+            {
+                ap_obj = pdf_annot_generate_square_appearance(&h->doc.doc_arena, x0, y0, x1, y1,
+                    0.8, 0.0, 0.0, 2.0, ap_num, bbox);
+                if (ap_obj == NULL)
+                {
+                    hb_retl(HB_FALSE);
+                    return;
+                }
+                annot_obj = pdf_annot_new_square(&h->doc.doc_arena, bbox, 0.8, 0.0, 0.0, ap_obj);
+            }
+            else
+            {
+                ap_obj = pdf_annot_generate_circle_appearance(&h->doc.doc_arena, x0, y0, x1, y1,
+                    0.8, 0.0, 0.0, 2.0, ap_num, bbox);
+                if (ap_obj == NULL)
+                {
+                    hb_retl(HB_FALSE);
+                    return;
+                }
+                annot_obj = pdf_annot_new_circle(&h->doc.doc_arena, bbox, 0.8, 0.0, 0.0, ap_obj);
+            }
+        }
+        break;
+
+    case 3: /* INK */
+    default:
+        ap_obj = pdf_annot_generate_ink_appearance(&h->doc.doc_arena, native_pts, n_points,
+            0.8, 0.0, 0.0, 2.0, ap_num, bbox);
+        if (ap_obj == NULL)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        annot_obj = pdf_annot_new_ink(&h->doc.doc_arena, bbox, native_pts, n_points,
+            0.8, 0.0, 0.0, ap_obj);
+        break;
+    }
+
+    if (annot_obj == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Resolver /Annots de la pagina -- mismos 3 casos y mismo puntero
+     * DIRECTO (no referencia) que Pdf_AnnotAddHighlight. */
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+    {
+        long annots_num = annots->u.ref.num;
+        const pdf_xref_entry *annots_entry;
+
+        annots = pdf_xref_load_object(&h->st, &h->xref, annots_num, &h->doc.doc_arena);
+        if (annots == NULL || annots->type != PDF_ARRAY)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        if (pdf_array_push(&h->doc.doc_arena, annots, annot_obj) != PDF_OK)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        annots_entry = pdf_xref_entry_at(&h->xref, annots_num);
+        mark_touched(h, annots_num, (annots_entry != NULL) ? annots_entry->gen : 0, annots);
+    }
+    else
+    {
+        const pdf_xref_entry *page_entry;
+
+        if (annots == NULL || annots->type != PDF_ARRAY)
+        {
+            annots = pdf_obj_new_array(&h->doc.doc_arena, 4);
+            pdf_dict_set(&h->doc.doc_arena, page_obj, "Annots", annots);
+        }
+        if (pdf_array_push(&h->doc.doc_arena, annots, annot_obj) != PDF_OK)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        page_entry = pdf_xref_entry_at(&h->xref, page_obj_num);
+        mark_touched(h, page_obj_num, (page_entry != NULL) ? page_entry->gen : 0, page_obj);
+    }
+
+    mark_touched(h, ap_num, 0, ap_obj);
+
+    hb_retl(HB_TRUE);
+}
+
+/* Pdf_AnnotAddTip( pDoc, nPagina, x, y, cTexto ) -> lReturn
+ *     Agrega un globo de tip (/Subtype /FreeText, ver pdf_annot.h) en
+ *     el punto (x,y) -- MISMO formato "topdown" local que Pdf_AnnotAdd
+ *     Highlight/Pdf_AnnotAddShape, pero un solo punto (el click, sin
+ *     arrastre; ver TPdfBitmap:StartTipEntry/CommitTipEntry,
+ *     pdf_viewer.prg). 'cTexto' es el mensaje corto tipeado por el
+ *     usuario -- se envuelve en lineas y se dibuja dentro del globo
+ *     (ver pdf_annot_generate_tip_appearance).
+ *
+ *     Mismas guardas y mismo mecanismo "touched objects" que
+ *     Pdf_AnnotAddHighlight/Pdf_AnnotAddShape -- solo muta el
+ *     documento EN MEMORIA, hace falta Pdf_FormSave() despues para
+ *     persistir. Estilo fijo en esta primera version (amarillo palido,
+ *     9pt Helvetica) -- sin selector todavia. */
+HB_FUNC(PDF_ANNOTADDTIP)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    double tx = hb_parnd(3);
+    double ty = hb_parnd(4);
+    const char *text = hb_parc(5);
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj;
+    long page_obj_num = -1;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+    double nx, ny;
+    long ap_num;
+    pdf_obj *ap_obj, *annot_obj;
+    pdf_obj *annots;
+    double bbox[4];
+
+    if (h == NULL || !h->open || page_index < 0 || text == NULL || text[0] == 0 ||
+        (long)strlen(text) > PDF_ANNOT_TIP_MAX_TEXT_LEN)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Mismas guardas que Pdf_AnnotAddHighlight/Pdf_AnnotAddShape -- ver
+     * el comentario grande junto a Pdf_AnnotAddHighlight. */
+    if (h->xref.crypt.active)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->xref.resolved == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->n_touched + 3 > PDF_HB_MAX_TOUCHED_OBJS)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    page_obj = pdf_document_get_page_ex(&h->st, &h->xref, &h->doc.doc_arena, page_index, &page_obj_num);
+    if (page_obj == NULL || page_obj_num <= 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
+     * calculo que PDF_GETPAGESIZEPT/PDF_RENDERTOHBITMAP/
+     * pdf_text_extract_page/Pdf_AnnotAddHighlight/Pdf_AnnotAddShape (6
+     * copias del mismo bloque en el motor antes de esta, cada una con
+     * este comentario cruzado -- si se corrige un bug aca corregirlo
+     * en las otras 6 tambien). */
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+
+    if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h, tx, ty, &nx, &ny))
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    ap_num = h->next_new_obj_num++;
+
+    ap_obj = pdf_annot_generate_tip_appearance(&h->doc.doc_arena, nx, ny, text, ap_num, bbox);
+    if (ap_obj == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    annot_obj = pdf_annot_new_freetext(&h->doc.doc_arena, bbox, text, ap_obj);
+    if (annot_obj == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Resolver /Annots -- mismos 3 casos y mismo puntero DIRECTO (no
+     * referencia) que Pdf_AnnotAddHighlight/Pdf_AnnotAddShape. */
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+    {
+        long annots_num = annots->u.ref.num;
+        const pdf_xref_entry *annots_entry;
+
+        annots = pdf_xref_load_object(&h->st, &h->xref, annots_num, &h->doc.doc_arena);
+        if (annots == NULL || annots->type != PDF_ARRAY)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        if (pdf_array_push(&h->doc.doc_arena, annots, annot_obj) != PDF_OK)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        annots_entry = pdf_xref_entry_at(&h->xref, annots_num);
+        mark_touched(h, annots_num, (annots_entry != NULL) ? annots_entry->gen : 0, annots);
+    }
+    else
+    {
+        const pdf_xref_entry *page_entry;
+
+        if (annots == NULL || annots->type != PDF_ARRAY)
+        {
+            annots = pdf_obj_new_array(&h->doc.doc_arena, 4);
+            pdf_dict_set(&h->doc.doc_arena, page_obj, "Annots", annots);
+        }
+        if (pdf_array_push(&h->doc.doc_arena, annots, annot_obj) != PDF_OK)
+        {
+            hb_retl(HB_FALSE);
+            return;
+        }
+        page_entry = pdf_xref_entry_at(&h->xref, page_obj_num);
+        mark_touched(h, page_obj_num, (page_entry != NULL) ? page_entry->gen : 0, page_obj);
+    }
+
+    mark_touched(h, ap_num, 0, ap_obj);
+
+    hb_retl(HB_TRUE);
+}
+
+/* Pdf_AnnotDeleteHighlightAt( pDoc, nPagina, x, y ) -> lReturn
+ *     Borra la PRIMERA anotacion /Highlight de 'nPagina' cuyo /Rect
+ *     contenga el punto (x,y) -- MISMO formato "topdown" local a la
+ *     pagina que BmpToPagePoint() devuelve en pdf_viewer.prg (TPdfBitmap:
+ *     LButtonDown la usa para "click sobre un resaltado existente lo
+ *     borra"). Si hay resaltados superpuestos, borra el primero
+ *     encontrado en el array /Annots (alcance simple, sin ordenar por
+ *     capas). Igual que Pdf_AnnotAddHighlight: solo muta el documento
+ *     EN MEMORIA, hace falta Pdf_FormSave() despues para persistir. */
+HB_FUNC(PDF_ANNOTDELETEHIGHLIGHTAT)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    double click_x = hb_parnd(3);
+    double click_y = hb_parnd(4);
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj, *annots;
+    long page_obj_num = -1;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+    double native_x, native_y;
+    int i, found_idx;
+
+    if (h == NULL || !h->open || page_index < 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Mismas guardas tempranas que Pdf_AnnotAddHighlight -- ver
+     * comentario grande ahi. Borrar necesita 1 solo slot nuevo en
+     * touched[] (la pagina o el array /Annots, segun el caso). */
+    if (h->xref.crypt.active)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->xref.resolved == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->n_touched + 1 > PDF_HB_MAX_TOUCHED_OBJS)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    page_obj = pdf_document_get_page_ex(&h->st, &h->xref, &h->doc.doc_arena, page_index, &page_obj_num);
+    if (page_obj == NULL || page_obj_num <= 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
+     * calculo que Pdf_AnnotAddHighlight/PDF_GETPAGESIZEPT/
+     * PDF_RENDERTOHBITMAP/pdf_text_extract_page (ahora 5 copias del
+     * mismo bloque en el motor). */
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+
+    /* El punto de click (topdown local) al MISMO espacio nativo que
+     * /Rect -- no hace falta una funcion "inversa" nueva: es la MISMA
+     * conversion que ya usa Pdf_AnnotAddHighlight para cada esquina de
+     * un rect nuevo (aca solo convertimos UN punto, el click). */
+    if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h,
+                                       click_x, click_y, &native_x, &native_y))
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Resolver /Annots -- si falta o no es array, no hay nada que
+     * borrar (a diferencia de Pdf_AnnotAddHighlight, ac'a NO se crea
+     * un array nuevo: un array vacio/inexistente significa "ningun
+     * resaltado en esta pagina"). Mismo idioma de resolucion (ref o
+     * inline) que pdf_render_draw_highlight_annotations. */
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+        annots = pdf_xref_load_object(&h->st, &h->xref, annots->u.ref.num, &h->doc.doc_arena);
+    if (annots == NULL || annots->type != PDF_ARRAY)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    found_idx = -1;
+    for (i = 0; i < annots->u.arr.count; i++)
+    {
+        pdf_obj *annot = annots->u.arr.items[i];
+        const char *subtype;
+        pdf_obj *rect_obj;
+        double rx0, ry0, rx1, ry1;
+
+        if (annot != NULL && annot->type == PDF_REF)
+            annot = pdf_xref_load_object(&h->st, &h->xref, annot->u.ref.num, &h->doc.doc_arena);
+        if (annot == NULL || (annot->type != PDF_DICT && annot->type != PDF_STREAM))
+            continue;
+
+        subtype = pdf_dict_get_name(annot, "Subtype");
+        if (subtype == NULL || strcmp(subtype, "Highlight") != 0)
+            continue;
+
+        rect_obj = pdf_dict_get(annot, "Rect");
+        if (rect_obj == NULL || rect_obj->type != PDF_ARRAY || rect_obj->u.arr.count != 4)
+            continue;
+
+        rx0 = obj_num(rect_obj->u.arr.items[0]);
+        ry0 = obj_num(rect_obj->u.arr.items[1]);
+        rx1 = obj_num(rect_obj->u.arr.items[2]);
+        ry1 = obj_num(rect_obj->u.arr.items[3]);
+        if (rx1 < rx0) { double t = rx0; rx0 = rx1; rx1 = t; }
+        if (ry1 < ry0) { double t = ry0; ry0 = ry1; ry1 = t; }
+
+        if (native_x >= rx0 && native_x <= rx1 && native_y >= ry0 && native_y <= ry1)
+        {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx < 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    if (pdf_array_remove_at(annots, found_idx) != PDF_OK)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    /* Marcar tocado lo que realmente cambio -- mismos 2 casos que
+     * Pdf_AnnotAddHighlight (si /Annots es referencia indirecta, se
+     * toca EL ARRAY; si vive inline en el dict de la pagina, se toca
+     * LA PAGINA). No hace falta un tercer caso "array nuevo" aca (si
+     * /Annots no existia, ya se devolvio .F. arriba). */
+    {
+        pdf_obj *annots_raw = pdf_dict_get(page_obj, "Annots");
+        if (annots_raw != NULL && annots_raw->type == PDF_REF)
+        {
+            long annots_num = annots_raw->u.ref.num;
+            const pdf_xref_entry *annots_entry = pdf_xref_entry_at(&h->xref, annots_num);
+            mark_touched(h, annots_num, (annots_entry != NULL) ? annots_entry->gen : 0, annots);
+        }
+        else
+        {
+            const pdf_xref_entry *page_entry = pdf_xref_entry_at(&h->xref, page_obj_num);
+            mark_touched(h, page_obj_num, (page_entry != NULL) ? page_entry->gen : 0, page_obj);
+        }
+    }
+
+    hb_retl(HB_TRUE);
+}
+
+/* Pdf_AnnotGetTipAt( pDoc, nPagina, x, y ) -> cTexto | NIL
+ *     Busca la PRIMERA anotacion /FreeText (globo de tip, ver
+ *     pdf_annot.h) de 'nPagina' cuyo /Rect contenga el punto (x,y) --
+ *     mismo formato "topdown" local que Pdf_AnnotDeleteHighlightAt/
+ *     Pdf_AnnotAddTip. Devuelve su /Contents (el mensaje actual) para
+ *     poder reabrirlo en el mismo cuadro de edicion (Arturo: "no se
+ *     puede modificar" -- ver TPdfBitmap:StartTipEntry, pdf_viewer.prg),
+ *     o NIL si no hay ningun tip ahi. Solo LEE -- no muta nada, no
+ *     necesita ningun guard de touched[]/cache de resolucion (a
+ *     diferencia de Add/Delete). */
+HB_FUNC(PDF_ANNOTGETTIPAT)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    double click_x = hb_parnd(3);
+    double click_y = hb_parnd(4);
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj, *annots;
+    long page_obj_num = -1;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+    double native_x, native_y;
+    int i;
+
+    if (h == NULL || !h->open || page_index < 0 || h->xref.crypt.active)
+        return; /* NIL */
+
+    page_obj = pdf_document_get_page_ex(&h->st, &h->xref, &h->doc.doc_arena, page_index, &page_obj_num);
+    if (page_obj == NULL || page_obj_num <= 0)
+        return;
+
+    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
+     * calculo que Pdf_AnnotDeleteHighlightAt/Pdf_AnnotAddTip (7ma
+     * copia del mismo bloque en el motor). */
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+
+    if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h,
+                                       click_x, click_y, &native_x, &native_y))
+        return;
+
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+        annots = pdf_xref_load_object(&h->st, &h->xref, annots->u.ref.num, &h->doc.doc_arena);
+    if (annots == NULL || annots->type != PDF_ARRAY)
+        return;
+
+    for (i = 0; i < annots->u.arr.count; i++)
+    {
+        pdf_obj *annot = annots->u.arr.items[i];
+        const char *subtype;
+        pdf_obj *rect_obj, *contents_obj;
+        double rx0, ry0, rx1, ry1;
+
+        if (annot != NULL && annot->type == PDF_REF)
+            annot = pdf_xref_load_object(&h->st, &h->xref, annot->u.ref.num, &h->doc.doc_arena);
+        if (annot == NULL || (annot->type != PDF_DICT && annot->type != PDF_STREAM))
+            continue;
+
+        subtype = pdf_dict_get_name(annot, "Subtype");
+        if (subtype == NULL || strcmp(subtype, "FreeText") != 0)
+            continue;
+
+        rect_obj = pdf_dict_get(annot, "Rect");
+        if (rect_obj == NULL || rect_obj->type != PDF_ARRAY || rect_obj->u.arr.count != 4)
+            continue;
+
+        rx0 = obj_num(rect_obj->u.arr.items[0]);
+        ry0 = obj_num(rect_obj->u.arr.items[1]);
+        rx1 = obj_num(rect_obj->u.arr.items[2]);
+        ry1 = obj_num(rect_obj->u.arr.items[3]);
+        if (rx1 < rx0) { double t = rx0; rx0 = rx1; rx1 = t; }
+        if (ry1 < ry0) { double t = ry0; ry0 = ry1; ry1 = t; }
+
+        if (native_x >= rx0 && native_x <= rx1 && native_y >= ry0 && native_y <= ry1)
+        {
+            contents_obj = pdf_dict_get(annot, "Contents");
+            if (contents_obj != NULL && contents_obj->type == PDF_STRING)
+                hb_retclen(contents_obj->u.str.data, contents_obj->u.str.len);
+            return;
+        }
+    }
+}
+
+/* Pdf_AnnotDeleteTipAt( pDoc, nPagina, x, y ) -> lReturn
+ *     Igual que Pdf_AnnotDeleteHighlightAt, pero para /FreeText (globo
+ *     de tip) -- copia byte a byte de esa funcion, cambiando solo el
+ *     filtro de Subtype. Se usa desde TPdfBitmap:CommitTipEntry para
+ *     "editar" un tip existente: borrar el viejo y agregar uno nuevo
+ *     con el texto actualizado en el mismo punto (mas simple y
+ *     confiable que mutar el /Contents/AP de la anotacion existente in
+ *     situ -- reusa Pdf_AnnotAddTip tal cual, sin un camino de
+ *     mutacion nuevo y sin probar). */
+HB_FUNC(PDF_ANNOTDELETETIPAT)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    double click_x = hb_parnd(3);
+    double click_y = hb_parnd(4);
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj, *annots;
+    long page_obj_num = -1;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+    double native_x, native_y;
+    int i, found_idx;
+
+    if (h == NULL || !h->open || page_index < 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    if (h->xref.crypt.active)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->xref.resolved == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->n_touched + 1 > PDF_HB_MAX_TOUCHED_OBJS)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    page_obj = pdf_document_get_page_ex(&h->st, &h->xref, &h->doc.doc_arena, page_index, &page_obj_num);
+    if (page_obj == NULL || page_obj_num <= 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+
+    if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h,
+                                       click_x, click_y, &native_x, &native_y))
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+        annots = pdf_xref_load_object(&h->st, &h->xref, annots->u.ref.num, &h->doc.doc_arena);
+    if (annots == NULL || annots->type != PDF_ARRAY)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    found_idx = -1;
+    for (i = 0; i < annots->u.arr.count; i++)
+    {
+        pdf_obj *annot = annots->u.arr.items[i];
+        const char *subtype;
+        pdf_obj *rect_obj;
+        double rx0, ry0, rx1, ry1;
+
+        if (annot != NULL && annot->type == PDF_REF)
+            annot = pdf_xref_load_object(&h->st, &h->xref, annot->u.ref.num, &h->doc.doc_arena);
+        if (annot == NULL || (annot->type != PDF_DICT && annot->type != PDF_STREAM))
+            continue;
+
+        subtype = pdf_dict_get_name(annot, "Subtype");
+        if (subtype == NULL || strcmp(subtype, "FreeText") != 0)
+            continue;
+
+        rect_obj = pdf_dict_get(annot, "Rect");
+        if (rect_obj == NULL || rect_obj->type != PDF_ARRAY || rect_obj->u.arr.count != 4)
+            continue;
+
+        rx0 = obj_num(rect_obj->u.arr.items[0]);
+        ry0 = obj_num(rect_obj->u.arr.items[1]);
+        rx1 = obj_num(rect_obj->u.arr.items[2]);
+        ry1 = obj_num(rect_obj->u.arr.items[3]);
+        if (rx1 < rx0) { double t = rx0; rx0 = rx1; rx1 = t; }
+        if (ry1 < ry0) { double t = ry0; ry0 = ry1; ry1 = t; }
+
+        if (native_x >= rx0 && native_x <= rx1 && native_y >= ry0 && native_y <= ry1)
+        {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx < 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    if (pdf_array_remove_at(annots, found_idx) != PDF_OK)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    {
+        pdf_obj *annots_raw = pdf_dict_get(page_obj, "Annots");
+        if (annots_raw != NULL && annots_raw->type == PDF_REF)
+        {
+            long annots_num = annots_raw->u.ref.num;
+            const pdf_xref_entry *annots_entry = pdf_xref_entry_at(&h->xref, annots_num);
+            mark_touched(h, annots_num, (annots_entry != NULL) ? annots_entry->gen : 0, annots);
+        }
+        else
+        {
+            const pdf_xref_entry *page_entry = pdf_xref_entry_at(&h->xref, page_obj_num);
+            mark_touched(h, page_obj_num, (page_entry != NULL) ? page_entry->gen : 0, page_obj);
+        }
+    }
+
+    hb_retl(HB_TRUE);
+}
+
+/* Pdf_AnnotDeleteShapeAt( pDoc, nPagina, x, y ) -> lReturn
+ *     Borra la PRIMERA forma libre (/Line, /Square, /Circle o /Ink --
+ *     ver pdf_annot.h) de 'nPagina' cuyo /Rect contenga el punto (x,y)
+ *     -- copia byte a byte de Pdf_AnnotDeleteHighlightAt/
+ *     Pdf_AnnotDeleteTipAt, cambiando solo el filtro de Subtype. A
+ *     diferencia del globo de tip (que tiene texto para editar, ver
+ *     Pdf_AnnotGetTipAt), estas formas no tienen nada que "editar" --
+ *     un click directo siempre borra, sin distincion de arrastre (ver
+ *     TPdfBitmap:LButtonDown, pdf_viewer.prg). Arturo: "es posible
+ *     eliminar circulo rectangulos lineas tintas". */
+HB_FUNC(PDF_ANNOTDELETESHAPEAT)
+{
+    pdf_hb_doc *h = (pdf_hb_doc *)hb_parptr(1);
+    int page_index = hb_parni(2) - 1;
+    double click_x = hb_parnd(3);
+    double click_y = hb_parnd(4);
+    pdf_obj *page_obj, *mediabox, *cropbox, *rotate_obj, *annots;
+    long page_obj_num = -1;
+    double media_x0, media_y0, media_x1, media_y1;
+    double crop_x0, crop_y0, crop_x1, crop_y1;
+    double page_w, page_h;
+    int rotate;
+    double native_x, native_y;
+    int i, found_idx;
+
+    if (h == NULL || !h->open || page_index < 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    if (h->xref.crypt.active)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->xref.resolved == NULL)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+    if (h->n_touched + 1 > PDF_HB_MAX_TOUCHED_OBJS)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    page_obj = pdf_document_get_page_ex(&h->st, &h->xref, &h->doc.doc_arena, page_index, &page_obj_num);
+    if (page_obj == NULL || page_obj_num <= 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    mediabox = pdf_dict_get(page_obj, "MediaBox");
+    if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
+    {
+        media_x0 = obj_num(mediabox->u.arr.items[0]);
+        media_y0 = obj_num(mediabox->u.arr.items[1]);
+        media_x1 = obj_num(mediabox->u.arr.items[2]);
+        media_y1 = obj_num(mediabox->u.arr.items[3]);
+        if (media_x1 < media_x0) { double t = media_x0; media_x0 = media_x1; media_x1 = t; }
+        if (media_y1 < media_y0) { double t = media_y0; media_y0 = media_y1; media_y1 = t; }
+    }
+    else
+    {
+        media_x0 = 0.0; media_y0 = 0.0; media_x1 = 612.0; media_y1 = 792.0;
+    }
+
+    crop_x0 = media_x0; crop_y0 = media_y0; crop_x1 = media_x1; crop_y1 = media_y1;
+    cropbox = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "CropBox");
+    if (cropbox != NULL && cropbox->type == PDF_ARRAY && cropbox->u.arr.count == 4)
+    {
+        double cx0 = obj_num(cropbox->u.arr.items[0]);
+        double cy0 = obj_num(cropbox->u.arr.items[1]);
+        double cx1 = obj_num(cropbox->u.arr.items[2]);
+        double cy1 = obj_num(cropbox->u.arr.items[3]);
+        if (cx1 < cx0) { double t = cx0; cx0 = cx1; cx1 = t; }
+        if (cy1 < cy0) { double t = cy0; cy0 = cy1; cy1 = t; }
+        if (cx0 > media_x0) crop_x0 = cx0;
+        if (cy0 > media_y0) crop_y0 = cy0;
+        if (cx1 < media_x1) crop_x1 = cx1;
+        if (cy1 < media_y1) crop_y1 = cy1;
+    }
+    if (crop_x1 <= crop_x0) { crop_x0 = media_x0; crop_x1 = media_x1; }
+    if (crop_y1 <= crop_y0) { crop_y0 = media_y0; crop_y1 = media_y1; }
+
+    page_w = crop_x1 - crop_x0;
+    page_h = crop_y1 - crop_y0;
+
+    rotate = 0;
+    rotate_obj = pdf_page_get_inherited(&h->st, &h->xref, &h->doc.doc_arena, page_obj, "Rotate");
+    if (rotate_obj != NULL)
+        rotate = pdf_normalize_rotation((int)obj_num(rotate_obj));
+
+    if (!pdf_render_topdown_to_native(rotate, crop_x0, crop_y0, page_w, page_h,
+                                       click_x, click_y, &native_x, &native_y))
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    annots = pdf_dict_get(page_obj, "Annots");
+    if (annots != NULL && annots->type == PDF_REF)
+        annots = pdf_xref_load_object(&h->st, &h->xref, annots->u.ref.num, &h->doc.doc_arena);
+    if (annots == NULL || annots->type != PDF_ARRAY)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    found_idx = -1;
+    for (i = 0; i < annots->u.arr.count; i++)
+    {
+        pdf_obj *annot = annots->u.arr.items[i];
+        const char *subtype;
+        pdf_obj *rect_obj;
+        double rx0, ry0, rx1, ry1;
+
+        if (annot != NULL && annot->type == PDF_REF)
+            annot = pdf_xref_load_object(&h->st, &h->xref, annot->u.ref.num, &h->doc.doc_arena);
+        if (annot == NULL || (annot->type != PDF_DICT && annot->type != PDF_STREAM))
+            continue;
+
+        subtype = pdf_dict_get_name(annot, "Subtype");
+        if (subtype == NULL ||
+            (strcmp(subtype, "Line") != 0 && strcmp(subtype, "Square") != 0 &&
+             strcmp(subtype, "Circle") != 0 && strcmp(subtype, "Ink") != 0))
+            continue;
+
+        rect_obj = pdf_dict_get(annot, "Rect");
+        if (rect_obj == NULL || rect_obj->type != PDF_ARRAY || rect_obj->u.arr.count != 4)
+            continue;
+
+        rx0 = obj_num(rect_obj->u.arr.items[0]);
+        ry0 = obj_num(rect_obj->u.arr.items[1]);
+        rx1 = obj_num(rect_obj->u.arr.items[2]);
+        ry1 = obj_num(rect_obj->u.arr.items[3]);
+        if (rx1 < rx0) { double t = rx0; rx0 = rx1; rx1 = t; }
+        if (ry1 < ry0) { double t = ry0; ry0 = ry1; ry1 = t; }
+
+        if (native_x >= rx0 && native_x <= rx1 && native_y >= ry0 && native_y <= ry1)
+        {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx < 0)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    if (pdf_array_remove_at(annots, found_idx) != PDF_OK)
+    {
+        hb_retl(HB_FALSE);
+        return;
+    }
+
+    {
+        pdf_obj *annots_raw = pdf_dict_get(page_obj, "Annots");
+        if (annots_raw != NULL && annots_raw->type == PDF_REF)
+        {
+            long annots_num = annots_raw->u.ref.num;
+            const pdf_xref_entry *annots_entry = pdf_xref_entry_at(&h->xref, annots_num);
+            mark_touched(h, annots_num, (annots_entry != NULL) ? annots_entry->gen : 0, annots);
+        }
+        else
+        {
+            const pdf_xref_entry *page_entry = pdf_xref_entry_at(&h->xref, page_obj_num);
+            mark_touched(h, page_obj_num, (page_entry != NULL) ? page_entry->gen : 0, page_obj);
+        }
+    }
 
     hb_retl(HB_TRUE);
 }

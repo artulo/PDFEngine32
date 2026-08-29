@@ -315,6 +315,29 @@ int pdf_array_push(pdf_arena *arena, pdf_obj *array_obj, pdf_obj *item)
     return PDF_OK;
 }
 
+int pdf_array_remove_at(pdf_obj *array_obj, int index)
+{
+    pdf_obj **cur_items;
+    int cur_count, i;
+
+    if (array_obj == NULL || array_obj->type != PDF_ARRAY)
+        return PDF_ERR_BADARG;
+
+    memcpy(&cur_count, &array_obj->u.arr.count, sizeof(cur_count));
+    memcpy(&cur_items, &array_obj->u.arr.items, sizeof(cur_items));
+
+    if (index < 0 || index >= cur_count)
+        return PDF_ERR_BADARG;
+
+    for (i = index; i < cur_count - 1; i++)
+        cur_items[i] = cur_items[i + 1];
+
+    cur_count--;
+    memcpy(&array_obj->u.arr.count, &cur_count, sizeof(cur_count));
+
+    return PDF_OK;
+}
+
 pdf_obj *pdf_obj_new_dict(pdf_arena *arena)
 {
     pdf_obj *o = pdf_obj_alloc(arena);
@@ -424,6 +447,43 @@ int pdf_dict_set(pdf_arena *arena, pdf_obj *obj, const char *key, pdf_obj *val)
     if (slot == NULL)
         return PDF_ERR_BADARG;
 
+    /* BUG REAL ENCONTRADO (limpieza de anotaciones de prueba, ver
+     * DESIGN.md): esta funcion SIEMPRE agregaba una entrada NUEVA al
+     * frente de la lista, sin buscar si 'key' ya existia -- llamarla
+     * dos veces con la MISMA clave (p.ej. pisar un /Annots que ya
+     * tenia contenido, en vez de crearlo desde /Annots ausente) dejaba
+     * DOS entradas con el mismo nombre en el dict. pdf_dict_get()
+     * (mas abajo) siempre devuelve la PRIMERA que encuentra recorriendo
+     * la lista, y como la entrada nueva queda al FRENTE, LEER el dict
+     * desde este mismo motor "andaba bien" -- pero write_dict_entries()
+     * (pdf_write.c) escribe TODAS las entradas sin filtrar duplicados,
+     * asi que el archivo guardado terminaba con la clave repetida DOS
+     * VECES en la sintaxis real. La norma dice que ante una clave
+     * duplicada "la ultima ocurrencia gana" -- como la entrada VIEJA
+     * queda ULTIMA en la lista (la nueva se prepende adelante), un
+     * lector conforme (confirmado con pikepdf/qpdf, que directamente
+     * avisa "dictionary has duplicated key") terminaba usando el valor
+     * VIEJO, ignorando por completo la actualizacion. Nunca se habia
+     * disparado antes porque todo el codigo de este proyecto que llama
+     * pdf_dict_set() sobre "Annots"/"V"/etc lo hacia SOLO cuando la
+     * clave todavia no existia (el caso "falta" de las 3 resoluciones
+     * de /Annots, ver Pdf_AnnotAddHighlight) -- limpiar TODAS las
+     * anotaciones de una pagina que YA tenia /Annots fue el primer
+     * caso real que reescribe una clave EXISTENTE.
+     *
+     * Fix: buscar la entrada existente primero -- si esta, actualizar
+     * su 'val' IN PLACE (misma entrada, mismo lugar en la lista, cero
+     * duplicados posibles); si no esta, agregar una nueva al frente
+     * como antes. */
+    for (e = *slot; e != NULL; e = e->next)
+    {
+        if (strcmp(e->key, key) == 0)
+        {
+            memcpy(&e->val, &val, sizeof(val));
+            return PDF_OK;
+        }
+    }
+
     e = (pdf_dict_entry *)pdf_arena_alloc(arena, sizeof(pdf_dict_entry));
     if (e == NULL)
         return PDF_ERR_NOMEM;
@@ -438,13 +498,11 @@ int pdf_dict_set(pdf_arena *arena, pdf_obj *obj, const char *key, pdf_obj *val)
 
     memcpy(keycopy, key, len + 1);
 
-    /* BUG REAL ENCONTRADO -- misma familia que los bugs documentados en
-     * pdf_obj_new_ref/pdf_obj_new_array/pdf_xref.c/pdf_stream.c: tres
-     * escrituras directas consecutivas a campos adyacentes de un
-     * struct recien alocado ('e->key'/'e->val'/'e->next'). Esta es la
-     * unica funcion que inserta entradas de dict para TODO el parser
-     * (cada /Key del PDF completo pasa por aca) -- se aplica el mismo
-     * fix preventivo via memcpy(). */
+    /* Misma familia de bugs documentados en pdf_obj_new_ref/
+     * pdf_obj_new_array/pdf_xref.c/pdf_stream.c: tres escrituras
+     * directas consecutivas a campos adyacentes de un struct recien
+     * alocado ('e->key'/'e->val'/'e->next') -- fix preventivo via
+     * memcpy(), mismo estilo que el resto del motor. */
     {
         pdf_dict_entry *next_val = *slot;
         memcpy(&e->key, &keycopy, sizeof(keycopy));

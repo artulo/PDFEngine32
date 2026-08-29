@@ -73,8 +73,26 @@
 // mismos valores que usa el propio FiveWin en otros archivos que tampoco
 // los exponen via .ch (navpanels.prg, scrolimg.prg): cada .prg que los
 // necesita los define localmente.
-#define IDC_HAND  32649
-#define IDC_ARROW 32512
+#define IDC_HAND    32649
+#define IDC_ARROW   32512
+#define IDC_SIZEALL 32646   // cursor de "mover" (4 flechas) -- feedback mientras se arrastra un globo de tip existente, ver METHOD MouseMove/LButtonUp mas abajo
+
+// Formas libres (Linea/Rectangulo/Circulo/Tinta, ver METHOD LButtonDown/
+// MouseMove/LButtonUp de TPdfBitmap mas abajo) -- preview en vivo con
+// GDI crudo (MoveTo/LineTo/Ellipse/CreatePen/SetROP2), todos bindings
+// de FiveWin ya confirmados contra el source real de FWH2603
+// (winapi\moveto.c/drawing.c/device.c/createpe.c) pero NINGUNO expuesto
+// por FiveWin.ch -- mismo criterio que SRCCOPY/IDC_HAND arriba, cada
+// .prg que los necesita los define el mismo. R2_XORPEN (modo de mezcla
+// XOR: dibujar el MISMO trazo dos veces con este modo restaura los
+// pixeles originales -- es el mecanismo de "un solo lugar en pantalla,
+// se prende y se apaga" para el rectangulo de goma de la vista previa,
+// sin tener que redibujar toda la pagina en cada MouseMove) no esta en
+// winapi.ch -- valor real de Windows (wingdi.h). PS_SOLID SI esta
+// (winapi.ch linea 199, mismo valor 0) -- no redefinirlo aca (Warning
+// W0002 real, confirmado compilando).
+#define R2_XORPEN   7
+#define R2_COPYPEN 13
 
 // GetDeviceCaps() -- impresion (METHOD PrintDocument mas abajo). Mismo
 // criterio: no vienen expuestos por FiveWin.ch, cada .prg los define
@@ -222,6 +240,68 @@ METHOD KeyDown( nKey, nFlags ) CLASS TPdfFormGet
 return ::Super:KeyDown( nKey, nFlags )
 
 //----------------------------------------------------------------------------//
+// TPdfTipEdit -- mensaje de un globo de tip (ver TPdfBitmap:StartTipEntry
+// mas abajo). Arturo: "sale pero no se queda con enter... debe ser
+// multiline" -- 2 correcciones reales sobre el primer intento (que usaba
+// un TPdfTipGet FROM TGet, de una sola linea):
+//
+// 1) BUG REAL: TGet:KeyDown() interceptaba VK_RETURN y llamaba
+//    CommitTipEntry() SIN pasar por ::Super:KeyDown() -- pero el volcado
+//    del buffer editado al bSetGet vinculado (Assign(), tget.prg linea
+//    3064) solo pasa DENTRO de LostFocus() o de la logica interna de
+//    KeyDown que nunca llegabamos a ejecutar (la cortabamos antes con
+//    "return 0"). Resultado: Enter "cerraba" el cuadro pero
+//    ::cTipValue seguia vacio (el Space(200) inicial), asi que
+//    CommitTipEntry() nunca encontraba texto para guardar. Fix: pasar a
+//    TEdit (mismo problema de fondo, pero con un metodo Read() propio y
+//    EXPLICITO, ver mas abajo) y llamarlo SIEMPRE antes de leer
+//    ::cTipValue en CommitTipEntry -- no importa por que camino se
+//    llego ahi (Enter, Ctrl+Enter, perdida de foco).
+//
+// 2) Multilinea: TEdit con lMultiLine (edit.prg linea 128-129) agrega
+//    ES_WANTRETURN -- el control mismo consume Enter como salto de
+//    linea (no como "enviar"), asi que hace falta otra tecla para
+//    confirmar: Ctrl+Enter (convencion comun -- Enter para nueva linea,
+//    Ctrl+Enter para confirmar, igual que muchos chats). ESC sigue
+//    cancelando sin persistir.
+//----------------------------------------------------------------------------//
+
+CLASS TPdfTipEdit FROM TEdit
+
+   DATA oPdfBmp     // TPdfBitmap dueño, para el callback de commit/cancel
+
+   METHOD LostFocus( hWndGetFocus )
+   METHOD KeyDown( nKey, nFlags )
+
+ENDCLASS
+
+//----------------------------------------------------------------------------//
+
+METHOD LostFocus( hWndGetFocus ) CLASS TPdfTipEdit
+   ::Super:LostFocus( hWndGetFocus )   // TEdit:LostFocus() (edit.prg linea 247-252) YA llama ::Read() -- vuelca el texto actual al bSetGet vinculado
+   if ::oPdfBmp != nil
+      ::oPdfBmp:CommitTipEntry()
+   endif
+return nil
+
+//----------------------------------------------------------------------------//
+
+METHOD KeyDown( nKey, nFlags ) CLASS TPdfTipEdit
+   if nKey == VK_RETURN .and. GetKeyState( VK_CONTROL )
+      if ::oPdfBmp != nil
+         ::oPdfBmp:CommitTipEntry()
+      endif
+      return 0
+   endif
+   if nKey == VK_ESCAPE
+      if ::oPdfBmp != nil
+         ::oPdfBmp:CancelTipEntry()
+      endif
+      return 0
+   endif
+return ::Super:KeyDown( nKey, nFlags )   // Enter SOLO (sin Ctrl) sigue de largo -- TEdit multilinea lo convierte en salto de linea, no en "enviar"
+
+//----------------------------------------------------------------------------//
 // TPdfBitmap -- subclase de TBitmap (fase 2 del roadmap de potencialidad
 // MuPDF: seleccion de texto por arrastre de mouse + copiar, ver DESIGN.md
 // seccion 70 y pdf_hbfunc.c: Pdf_ExtractText/Pdf_FindText/Pdf_GlyphsInRect/
@@ -271,6 +351,57 @@ CLASS TPdfBitmap FROM TBitmap
    DATA nPanStartX
    DATA nPanStartY
 
+   // Formas libres (::oViewer:cDrawMode != NIL, ver DATA arriba en
+   // TPdfViewer) -- arrastre en curso para dibujar Linea/Rectangulo/
+   // Circulo/Tinta nueva. ::nDrawStartRow/Col es la esquina donde
+   // arranco el arrastre (fila/columna de CONTROL, no de pagina --
+   // igual que ::nSelStartRow/Col de la seleccion de texto);
+   // ::nDrawLastRow/Col es el ultimo punto donde se dibujo el preview
+   // (para el toggle XOR: redibujarlo ahi primero lo borra). Solo
+   // Ink usa ::aDrawPoints (acumula CADA punto del trazo -- Linea/
+   // Rectangulo/Circulo son 2 puntos nomas, no hace falta acumular).
+   DATA lDrawing        INIT .F.
+   DATA nDrawStartRow
+   DATA nDrawStartCol
+   DATA nDrawLastRow
+   DATA nDrawLastCol
+   DATA aDrawPoints     INIT {}
+   DATA hDrawPen
+
+   // Globo de tip -- NO es un arrastre: un solo clic arma un TEdit
+   // dinamico (::oTipGet, ver TPdfTipEdit arriba) ahi mismo para
+   // escribir el mensaje, sea con "Tip" armado (::oViewer:cDrawMode ==
+   // "TIP") o con un clic directo sobre un globo YA existente (ver
+   // LButtonDown -- Arturo: "no se puede modificar" -- edicion sin
+   // necesidad de armar el boton "Tip" primero). ::nTipStartRow/Col
+   // guarda el punto clickeado (fila/columna de CONTROL) para
+   // convertirlo a espacio de pagina recien al confirmar.
+   // ::lTipEditing distingue "creando uno nuevo" de "editando uno que
+   // ya existia en ese punto" -- en edicion, confirmar borra el viejo
+   // y agrega uno nuevo con el texto actualizado (ver CommitTipEntry);
+   // ESC en edicion deja el original SIN TOCAR (nunca se llega a
+   // borrar nada hasta confirmar).
+   DATA oTipGet
+   DATA nTipStartRow
+   DATA nTipStartCol
+   DATA cTipValue
+   DATA lTipEditing     INIT .F.
+
+   // Mover un globo existente (Arturo: "debe permitirse que se pueda
+   // mover la posicion") -- arrancado por un click sobre un tip YA
+   // existente (ver LButtonDown), pero la decision real (fue un click =
+   // editar en el lugar de siempre, o fue un arrastre = mover) se toma
+   // en LButtonUp segun cuanto se movio el mouse (mismo umbral en
+   // PIXELES que el guard de arrastre-minimo de las 4 formas).
+   // ::cTipMoveText guarda el texto del globo (leido en el momento del
+   // click) para poder re-agregarlo tal cual en el punto nuevo si
+   // termina siendo un arrastre -- "mover" es "borrar en el origen +
+   // agregar en el destino", mismo criterio que "editar" ya usa.
+   DATA lTipMoving       INIT .F.
+   DATA nTipMoveStartRow
+   DATA nTipMoveStartCol
+   DATA cTipMoveText
+
    METHOD MButtonDown( nRow, nCol, nKeyFlags )
    METHOD MButtonUp( nRow, nCol, nKeyFlags )
 
@@ -309,6 +440,21 @@ CLASS TPdfBitmap FROM TBitmap
    METHOD SelectedText()                     // -> cString UTF-8 (puede ser "")
    METHOD CopySelection()                    // -> .T./.F. (via portapapeles)
    METHOD HighlightSelection()               // -> .T./.F. (agrega /Highlight, ver DESIGN.md)
+
+   // Formas libres -- preview XOR en vivo de Linea/Rectangulo/Circulo
+   // (Ink no lo usa, ver METHOD MouseMove). Dibuja el trazo desde
+   // ::nDrawStartRow/Col hasta (nRow,nCol) en modo R2_XORPEN -- llamar
+   // DOS VECES con el MISMO (nRow,nCol) deja los pixeles como estaban
+   // (esa es la gracia del XOR), asi que "borrar el frame anterior" es
+   // literalmente "volver a llamar con las mismas coordenadas de la
+   // ultima vez".
+   METHOD DrawShapePreviewAt( nRow, nCol )
+   METHOD CancelDrawing()                    // aborta un arrastre en curso (ESC) sin crear nada
+
+   // Globo de tip -- clic (no arrastre), ver DATA oTipGet arriba.
+   METHOD StartTipEntry( nRow, nCol )        // arma el TEdit dinamico en (nRow,nCol), precargado si ya habia un tip ahi
+   METHOD CommitTipEntry()                   // vuelca ::cTipValue a Pdf_AnnotAddTip/Pdf_AnnotDeleteTipAt segun corresponda, destruye el control, re-renderiza
+   METHOD CancelTipEntry()                   // destruye el control sin tocar el documento (ESC)
 
 ENDCLASS
 
@@ -659,7 +805,7 @@ return nil
 
 METHOD LButtonDown( nRow, nCol, nKeyFlags ) CLASS TPdfBitmap
 
-   local aP, aField
+   local aP, aField, cTipText
 
    ::ClearFormEdit()
 
@@ -681,6 +827,87 @@ METHOD LButtonDown( nRow, nCol, nKeyFlags ) CLASS TPdfBitmap
             ::oViewer:RefreshRender()
             return 0
          endif
+      endif
+
+      // Formas libres/Tip armados (::oViewer:cDrawMode != NIL, botones
+      // "Linea"/"Rectangulo"/"Circulo"/"Tinta"/"Tip" de la toolbar, ver
+      // DESIGN.md) -- con una herramienta de dibujo armada, la
+      // intencion del click SIEMPRE es "dibujar/anotar aca", nunca
+      // "de paso, borrame este resaltado" -- por eso este chequeo va
+      // ANTES del hit-test de borrar-resaltado (AJUSTE: antes iba
+      // despues, y un click sobre un resaltado existente con una
+      // herramienta armada lo borraba en vez de dibujar ahi -- bug
+      // real encontrado al agregar el globo de tip, afectaba tambien
+      // a las 4 formas ya enviadas). Sigue yendo DESPUES de AcroForm
+      // (un campo editable siempre gana si se solapan).
+      if ::oViewer != nil .and. ::oViewer:cDrawMode != nil
+
+         if ::oViewer:cDrawMode == "TIP"
+            ::StartTipEntry( nRow, nCol )
+            return 0
+         endif
+
+         ::lDrawing      := .T.
+         ::nDrawStartRow := nRow
+         ::nDrawStartCol := nCol
+         ::nDrawLastRow  := nRow
+         ::nDrawLastCol  := nCol
+         ::aDrawPoints   := { { nRow, nCol } }
+         ::hDrawPen      := CreatePen( PS_SOLID, 2, RGB( 204, 0, 0 ) )
+         ::Capture()
+         return 0
+      endif
+
+      // Borrar resaltado (Arturo: "vamos por las anotaciones" -> borrar/
+      // deshacer un resaltado, ver DESIGN.md) -- click sobre un /Highlight
+      // existente lo borra directo, mismo espiritu que cualquier visor de
+      // PDF real (click en la marca para sacarla). Prioridad DESPUES de
+      // AcroForm y de cualquier herramienta de dibujo armada (arriba),
+      // pero ANTES de arrancar una seleccion de texto nueva -- si no cae
+      // sobre ningun resaltado, sigue exactamente el comportamiento de
+      // siempre.
+      if Pdf_AnnotDeleteHighlightAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
+         ::oViewer:RefreshRenderPage( aP[ 1 ] )
+         return 0
+      endif
+
+      // Borrar una forma libre existente (Linea/Rectangulo/Circulo/
+      // Tinta -- Arturo: "es posible eliminar circulo rectangulos
+      // lineas tintas") -- click directo la borra, mismo espiritu que
+      // borrar-resaltado arriba (a diferencia del globo de tip, estas
+      // formas no tienen texto que editar, asi que no hace falta
+      // distinguir click-de-arrastre: un click siempre borra, sin
+      // ningun modo que armar). Prioridad DESPUES de borrar-resaltado y
+      // ANTES de tip -- si no cae sobre ninguna forma, sigue el
+      // comportamiento de siempre.
+      if Pdf_AnnotDeleteShapeAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
+         ::oViewer:RefreshRenderPage( aP[ 1 ] )
+         return 0
+      endif
+
+      // Editar/mover un globo de tip existente (Arturo: "no se puede
+      // modificar", despues "debe permitirse que se pueda mover la
+      // posicion") -- funciona SIN necesidad de armar el boton "Tip"
+      // primero, mismo espiritu que borrar-resaltado arriba (un click
+      // directo alcanza). Si ninguna herramienta de dibujo esta armada
+      // (si "Tip" SI esta armado, esto ya lo maneja StartTipEntry mas
+      // arriba -- ahi un clic SIEMPRE abre/crea en el punto exacto, sin
+      // distincion de arrastre) y el click cae sobre un globo existente,
+      // arma un posible arrastre (::lTipMoving) en vez de decidir ya
+      // mismo -- LButtonUp es quien recien ahi distingue "fue un click"
+      // (abrir para editar en el punto ORIGINAL, comportamiento de
+      // siempre) de "fue un arrastre" (mover el globo al punto nuevo,
+      // mismo texto) segun cuanto se movio el mouse. Si no hay ningun
+      // tip ahi, sigue el comportamiento de siempre (seleccion de
+      // texto).
+      cTipText := Pdf_AnnotGetTipAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
+      if cTipText != nil
+         ::lTipMoving       := .T.
+         ::cTipMoveText     := cTipText
+         ::nTipMoveStartRow := nRow
+         ::nTipMoveStartCol := nCol
+         ::Capture()
+         return 0
       endif
    endif
 
@@ -732,6 +959,7 @@ METHOD MouseMove( nRow, nCol, nKeyFlags ) CLASS TPdfBitmap
    local aP0, aP1
    local aRect, nVisHeight, nVisWidth
    local nMinX, nMinY, nNewX, nNewY
+   local hDC, nDrawDist
 
    // Arrastre con el boton central en curso -- mueve ::nX/::nY directo
    // (mismo mecanismo que MouseWheel()/ScrollToPagePoint() mas abajo) por
@@ -778,6 +1006,48 @@ METHOD MouseMove( nRow, nCol, nKeyFlags ) CLASS TPdfBitmap
       return 0
    endif
 
+   // Mover un globo de tip existente (ver LButtonDown/LButtonUp) --
+   // sin preview grafico en esta primera version (re-generar el globo
+   // completo -- caja + colita + texto envuelto -- en cada MouseMove
+   // pediria invocar el motor C repetidamente, mas caro que el XOR
+   // simple de las 4 formas de abajo); el UNICO feedback mientras se
+   // arrastra es el cursor de "mover" -- confirmar con LButtonUp
+   // siempre re-renderiza la pagina entera de cualquier forma.
+   if ::lTipMoving
+      SetCursor( LoadCursor( 0, IDC_SIZEALL ) )
+      return 0
+   endif
+
+   // Formas libres: arrastre de dibujo en curso (ver LButtonDown).
+   // LINE/RECT/CIRCLE usan un preview XOR (togglear el frame anterior lo
+   // borra, dibujar el nuevo lo muestra -- ver DrawShapePreviewAt()); INK
+   // no usa XOR (un trazo libre solo CRECE, no hay "vista previa de
+   // esquina" que corregir cuadro a cuadro) -- dibuja el segmento nuevo
+   // de forma normal, solo si el mouse se movio al menos ~3px desde el
+   // ultimo punto acumulado (evita sobre-muestrear en un MouseMove muy
+   // denso).
+   if ::lDrawing .and. ::oViewer != nil .and. ::oViewer:cDrawMode != nil
+      if ::oViewer:cDrawMode == "INK"
+         nDrawDist := Sqrt( ( nRow - ::nDrawLastRow ) ^ 2 + ( nCol - ::nDrawLastCol ) ^ 2 )
+         if nDrawDist >= 3
+            hDC := ::GetDC()
+            SetROP2( hDC, R2_COPYPEN )
+            MoveTo( hDC, ::nDrawLastCol, ::nDrawLastRow )
+            LineTo( hDC, nCol, nRow, ::hDrawPen )
+            ::ReleaseDC()
+            AAdd( ::aDrawPoints, { nRow, nCol } )
+            ::nDrawLastRow := nRow
+            ::nDrawLastCol := nCol
+         endif
+      else
+         ::DrawShapePreviewAt( ::nDrawLastRow, ::nDrawLastCol )   // borra el frame anterior (XOR dos veces = identidad)
+         ::DrawShapePreviewAt( nRow, nCol )                       // dibuja el nuevo
+         ::nDrawLastRow := nRow
+         ::nDrawLastCol := nCol
+      endif
+      return 0
+   endif
+
    if ::lSelecting .and. ::oViewer != nil .and. ::oViewer:pDoc != nil
       aP0 := ::BmpToPagePoint( ::nSelStartRow, ::nSelStartCol )
       aP1 := ::BmpToPagePoint( nRow, nCol )
@@ -806,9 +1076,106 @@ return ::Super:MouseMove( nRow, nCol, nKeyFlags )
 
 METHOD LButtonUp( nRow, nCol, nKeyFlags ) CLASS TPdfBitmap
 
+   local aPoints, aP0, aP1, i, aPt, cType, lOK, nPage
+
    if ::lSelecting
       ::lSelecting := .F.
       ReleaseCapture()
+   endif
+
+   // Mover/editar un globo de tip existente (ver LButtonDown) -- recien
+   // aca se decide si el click terminó siendo un simple click (abrir
+   // para editar en el punto ORIGINAL, comportamiento de siempre) o un
+   // arrastre real (mover el globo: borrar en el origen + agregar el
+   // MISMO texto en el destino). Mismo umbral en PIXELES de pantalla
+   // que el guard de arrastre-minimo de las 4 formas (ver LButtonUp mas
+   // abajo) -- en puntos de pagina se sentiria distinto segun el zoom.
+   if ::lTipMoving
+      ::lTipMoving := .F.
+      ReleaseCapture()
+      SetCursor( LoadCursor( 0, IDC_ARROW ) )
+
+      if Abs( nRow - ::nTipMoveStartRow ) < 4 .and. Abs( nCol - ::nTipMoveStartCol ) < 4
+         ::StartTipEntry( ::nTipMoveStartRow, ::nTipMoveStartCol )
+      else
+         if ::oViewer != nil .and. ::oViewer:pDoc != nil
+            aP0 := ::BmpToPagePoint( ::nTipMoveStartRow, ::nTipMoveStartCol )   // origen
+            aP1 := ::BmpToPagePoint( nRow, nCol )                              // destino
+            Pdf_AnnotDeleteTipAt( ::oViewer:pDoc, aP0[ 1 ], aP0[ 2 ], aP0[ 3 ] )
+            lOK := Pdf_AnnotAddTip( ::oViewer:pDoc, aP1[ 1 ], aP1[ 2 ], aP1[ 3 ], ::cTipMoveText )
+            if lOK
+               ::oViewer:RefreshRenderPage( aP1[ 1 ] )
+               // Vista continua: origen y destino pueden ser paginas
+               // distintas -- si el borrado y el agregado cayeron en
+               // paginas diferentes, la de origen tambien necesita su
+               // propio refresco (si no, el globo "viejo" seguiria
+               // viendose ahi hasta el proximo repintado por otra razon).
+               if aP0[ 1 ] != aP1[ 1 ]
+                  ::oViewer:RefreshRenderPage( aP0[ 1 ] )
+               endif
+            endif
+         endif
+      endif
+
+      return 0
+   endif
+
+   if ::lDrawing
+      ::lDrawing := .F.
+      cType := ::oViewer:cDrawMode
+      ReleaseCapture()
+
+      if cType != nil
+         if cType == "INK"
+            // Ya se fue dibujando de forma incremental (MouseMove) --
+            // solo falta convertir los puntos acumulados a espacio de
+            // pagina y persistir.
+            aPoints := {}
+            nPage   := nil
+            for i := 1 to Len( ::aDrawPoints )
+               aPt := ::aDrawPoints[ i ]
+               aP0 := ::BmpToPagePoint( aPt[ 1 ], aPt[ 2 ] )
+               if nPage == nil ; nPage := aP0[ 1 ] ; endif
+               AAdd( aPoints, { aP0[ 2 ], aP0[ 3 ] } )
+            next
+            if Len( aPoints ) >= 2 .and. nPage != nil
+               lOK := Pdf_AnnotAddShape( ::oViewer:pDoc, nPage, "INK", aPoints )
+               if lOK
+                  ::oViewer:RefreshRenderPage( nPage )
+               endif
+            endif
+         else
+            // Linea/Rectangulo/Circulo -- guarda de arrastre minimo en
+            // PIXELES de pantalla (no en puntos de pagina -- a distinto
+            // zoom un umbral en puntos de pagina se sentiria muy
+            // distinto; en pixeles es lo que el usuario realmente
+            // percibe como "arrastre real vs. click accidental").
+            if Abs( nRow - ::nDrawStartRow ) >= 4 .or. Abs( nCol - ::nDrawStartCol ) >= 4
+               aP0 := ::BmpToPagePoint( ::nDrawStartRow, ::nDrawStartCol )
+               aP1 := ::BmpToPagePoint( nRow, nCol )
+               aPoints := { { aP0[ 2 ], aP0[ 3 ] }, { aP1[ 2 ], aP1[ 3 ] } }
+               lOK := Pdf_AnnotAddShape( ::oViewer:pDoc, aP0[ 1 ], cType, aPoints )
+               if lOK
+                  ::oViewer:RefreshRenderPage( aP0[ 1 ] )
+               endif
+            endif
+         endif
+      endif
+
+      if ::hDrawPen != nil
+         DeleteObject( ::hDrawPen )
+         ::hDrawPen := nil
+      endif
+      ::aDrawPoints := {}
+
+      // El modo de dibujo se desactiva SOLO al terminar (como Acrobat,
+      // no como AutoCAD/DWGEngine -- ver DATA cDrawMode en TPdfViewer)
+      // -- SIEMPRE, aunque el arrastre haya sido descartado por chico o
+      // Pdf_AnnotAddShape haya fallado (evita dejar el modo armado por
+      // accidente).
+      ::oViewer:StopDrawMode()
+
+      return 0
    endif
 
 return ::Super:LButtonUp( nRow, nCol, nKeyFlags )
@@ -816,6 +1183,32 @@ return ::Super:LButtonUp( nRow, nCol, nKeyFlags )
 //----------------------------------------------------------------------------//
 
 METHOD KeyDown( nKey, nFlags ) CLASS TPdfBitmap
+
+   // ESC cancela un arrastre de forma libre EN CURSO (ver DATA lDrawing
+   // arriba) -- alcanza con el foco en el canvas (el caso normal a
+   // mitad de un arrastre, que es cuando esto realmente importa).
+   // Cancelar un modo YA armado pero todavia sin arrastrar nada (foco
+   // recien despues de clickear el boton de la toolbar) queda fuera de
+   // alcance -- agregar un accelerator a nivel ventana para ese caso
+   // exigiria agregarle un MENU a esta app (hoy no tiene ninguno, ver
+   // pdf_demo.prg); el boton "Normal" sigue siendo el camino para ese
+   // caso puntual (ver DESIGN.md).
+   if nKey == VK_ESCAPE .and. ::lDrawing
+      ::CancelDrawing()
+      return 0
+   endif
+
+   // ESC cancela un arrastre de "mover globo de tip" EN CURSO (ver
+   // LButtonDown/LButtonUp) -- no hace falta deshacer nada en el motor
+   // (el borrado+re-agregado solo pasa al SOLTAR el mouse en
+   // LButtonUp, nunca durante el arrastre), asi que alcanza con
+   // resetear el estado y liberar la captura.
+   if nKey == VK_ESCAPE .and. ::lTipMoving
+      ::lTipMoving := .F.
+      ReleaseCapture()
+      SetCursor( LoadCursor( 0, IDC_ARROW ) )
+      return 0
+   endif
 
    // 'C' == Asc( "C" ) == 67 -- los codigos de tecla virtual de Windows
    // para letras COINCIDEN con el ASCII mayuscula (mismo idioma que
@@ -1016,6 +1409,257 @@ METHOD HighlightSelection() CLASS TPdfBitmap
    ::oViewer:RefreshRender()
 
 return .T.
+
+//----------------------------------------------------------------------------//
+// Formas libres -- preview XOR en vivo de Linea/Rectangulo/Circulo durante
+// el arrastre (ver METHOD MouseMove arriba). Dibuja desde el punto donde
+// arranco el arrastre (::nDrawStartRow/Col, FIJO durante todo el
+// arrastre) hasta (nRow,nCol) -- llamar dos veces con el MISMO (nRow,nCol)
+// en modo R2_XORPEN deja los pixeles como estaban (esa es la gracia del
+// XOR: MouseMove llama primero con el ULTIMO punto para "borrar" ese
+// frame, despues con el punto actual para mostrar el nuevo).
+//
+// NO usa el binding RECTANGLE() de FiveWin para el preview de Rectangulo
+// -- su mapeo de parametros a los slots de Win32 (winapi/drawing.c) NO es
+// el pass-through directo que si tiene ELLIPSE(): transpone fila/columna
+// Y ademas invierte right/bottom, y no hay ningun call site real en todo
+// el arbol de FWH2603 para verificarlo empiricamente -- 4x MoveTo/LineTo
+// da el mismo resultado sin esa ambiguedad. LineTo() ya selecciona (y
+// restaura) el pen que se le pasa como ultimo parametro (winapi/
+// drawing.c) -- no hace falta un SelectObject manual aparte para el pen.
+//----------------------------------------------------------------------------//
+
+METHOD DrawShapePreviewAt( nRow, nCol ) CLASS TPdfBitmap
+
+   local hDC, hOldBrush
+
+   if ::hDrawPen == nil .or. ::oViewer == nil .or. ::oViewer:cDrawMode == nil
+      return nil
+   endif
+
+   hDC := ::GetDC()
+   SetROP2( hDC, R2_XORPEN )
+
+   do case
+   case ::oViewer:cDrawMode == "LINE"
+      MoveTo( hDC, ::nDrawStartCol, ::nDrawStartRow )
+      LineTo( hDC, nCol, nRow, ::hDrawPen )
+
+   case ::oViewer:cDrawMode == "RECT"
+      MoveTo( hDC, ::nDrawStartCol, ::nDrawStartRow )
+      LineTo( hDC, nCol,            ::nDrawStartRow, ::hDrawPen )
+      LineTo( hDC, nCol,            nRow,            ::hDrawPen )
+      LineTo( hDC, ::nDrawStartCol, nRow,             ::hDrawPen )
+      LineTo( hDC, ::nDrawStartCol, ::nDrawStartRow,  ::hDrawPen )
+
+   case ::oViewer:cDrawMode == "CIRCLE"
+      // NULL_BRUSH (indice 5 de GetStockObject, ver winapi/getstkob.c) --
+      // Ellipse() rellena con el brush actual del DC si no se lo saca;
+      // el preview tiene que ser solo el contorno, igual que la forma
+      // final (sin /IC, ver pdf_annot.c).
+      hOldBrush := SelectObject( hDC, GetStockObject( 5 ) )
+      Ellipse( hDC, Min( ::nDrawStartCol, nCol ), Min( ::nDrawStartRow, nRow ), ;
+                    Max( ::nDrawStartCol, nCol ), Max( ::nDrawStartRow, nRow ), ::hDrawPen )
+      SelectObject( hDC, hOldBrush )
+
+   endcase
+
+   SetROP2( hDC, R2_COPYPEN )
+   ::ReleaseDC()
+
+return nil
+
+//----------------------------------------------------------------------------//
+// Aborta un arrastre de forma libre en curso (ESC, ver METHOD KeyDown) sin
+// crear ninguna anotacion -- limpia el mismo estado que LButtonUp pero sin
+// llamar Pdf_AnnotAddShape. Para Ink, que se dibuja de forma NORMAL (no
+// XOR) durante el arrastre (ver MouseMove), un ::Refresh() completo saca
+// cualquier trazo parcial que haya quedado en pantalla (no hay "frame
+// anterior" que togglear para borrarlo, a diferencia de Linea/Rectangulo/
+// Circulo).
+//----------------------------------------------------------------------------//
+
+METHOD CancelDrawing() CLASS TPdfBitmap
+
+   local lWasInk := ( ::oViewer != nil .and. ::oViewer:cDrawMode == "INK" )
+
+   if ::lDrawing
+      if !lWasInk
+         ::DrawShapePreviewAt( ::nDrawLastRow, ::nDrawLastCol )
+      endif
+      ::lDrawing := .F.
+      ReleaseCapture()
+      if ::hDrawPen != nil
+         DeleteObject( ::hDrawPen )
+         ::hDrawPen := nil
+      endif
+      ::aDrawPoints := {}
+      if lWasInk
+         ::Refresh()
+      endif
+   endif
+
+   if ::oViewer != nil
+      ::oViewer:StopDrawMode()
+   endif
+
+return nil
+
+//----------------------------------------------------------------------------//
+// Globo de tip -- un solo clic (no arrastre, ver LButtonDown) arma un TEdit
+// dinamico EXACTO en (nRow,nCol) (a diferencia de StartFieldEdit, que
+// posiciona el control segun el /Rect de un campo YA existente, aca el
+// click mismo define la posicion -- no hay ningun rectangulo previo del
+// que partir).
+//
+// Si el click cae sobre un globo YA existente (Pdf_AnnotGetTipAt, ver
+// pdf_hbfunc.c), se precarga su texto actual y se arma ::lTipEditing --
+// Arturo: "no se puede modificar" -- CommitTipEntry() se encarga de
+// borrar el viejo y agregar uno nuevo con el texto actualizado (ver mas
+// abajo). Se llama tanto con "Tip" armado (click en cualquier lado) como
+// SIN ningun modo armado (click directo sobre un globo existente, ver
+// LButtonDown) -- en ese segundo caso, si NO hay ningun globo ahi, el
+// llamador ni siquiera invoca este metodo (ver LButtonDown).
+//----------------------------------------------------------------------------//
+
+METHOD StartTipEntry( nRow, nCol ) CLASS TPdfBitmap
+
+   local aP, cExisting
+
+   ::ClearFormEdit()
+
+   ::nTipStartRow := nRow
+   ::nTipStartCol := nCol
+   ::cTipValue    := ""
+   ::lTipEditing  := .F.
+
+   if ::oViewer != nil .and. ::oViewer:pDoc != nil
+      aP := ::BmpToPagePoint( nRow, nCol )
+      cExisting := Pdf_AnnotGetTipAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
+      if cExisting != nil
+         ::cTipValue   := cExisting
+         ::lTipEditing := .T.
+      endif
+   endif
+
+   // BUG REAL ENCONTRADO (crash confirmado con error.log real, Arturo):
+   // TEdit:New() (edit.prg linea 138-143) evalua If(lRight,...)/
+   // If(lCenter,...)/If(lNumber,...)/If(lUpper,...) SIN ningun DEFAULT
+   // que los proteja de NIL (a diferencia de lMultiLine/lReadOnly/
+   // lPassword, que SI tienen DEFAULT ... := .F. mas arriba en el mismo
+   // metodo, linea 109) -- omitir esos parametros posicionales (dejar
+   // que Harbour los mande como NIL) hace que If() truene con "Argument
+   // error: conditional" apenas se intenta crear el control. Hay que
+   // pasar EXPLICITO hasta la ultima posicion que el metodo lee sin
+   // proteccion (lUpper, posicion 19) -- no alcanza con parar en
+   // lMultiLine (13) como en el primer intento.
+   ::oTipGet := TPdfTipEdit():New( nRow, nCol, ;
+      {| u | if( u == nil, ::cTipValue, ::cTipValue := u ) }, ;
+      ::oWnd, 220, 70, .T., NIL, NIL, NIL, NIL, NIL, .T., ;
+      .F., .F., .F., .F., .F., .F. )
+   ::oTipGet:oPdfBmp := Self
+   ::oTipGet:SetFocus()   // TEdit:GotFocus() (edit.prg linea 56) ya selecciona todo el texto solo -- comodo para sobreescribir un tip existente
+
+return nil
+
+//----------------------------------------------------------------------------//
+// Vuelca ::cTipValue a Pdf_AnnotAddTip -- mismo criterio idempotente que
+// CommitFieldEdit (si no hay entrada activa, ::oTipGet ya es NIL, no hace
+// nada). ::oTipGet:Read() (edit.prg linea 286) fuerza el sync ANTES de
+// leer ::cTipValue -- SIEMPRE, sin importar por que camino se llego aca
+// (Ctrl+Enter, perdida de foco) -- ver el comentario grande junto a
+// TPdfTipEdit sobre el bug real de "no se queda con Enter".
+//
+// Si se estaba EDITANDO un globo existente (::lTipEditing): se borra el
+// viejo (Pdf_AnnotDeleteTipAt) y, si el mensaje nuevo no quedo vacio, se
+// agrega uno nuevo con el texto actualizado en el MISMO punto -- "editar"
+// es "borrar + re-agregar" (reusa Pdf_AnnotAddTip tal cual, sin un camino
+// de mutacion in-situ nuevo y sin probar). Si el mensaje quedo vacio
+// (usuario borro todo el texto y confirmo), el globo queda borrado -- no
+// se re-agrega nada, mismo espiritu que "clic sin escribir nada no crea
+// nada" pero aplicado a un globo YA existente.
+//
+// Si se estaba CREANDO uno nuevo (no editando) y el mensaje quedo vacio,
+// no se crea nada -- mismo espiritu que el guard de arrastre-minimo de
+// las 4 formas.
+//----------------------------------------------------------------------------//
+
+METHOD CommitTipEntry() CLASS TPdfBitmap
+
+   local oGet := ::oTipGet
+   local nRow := ::nTipStartRow
+   local nCol := ::nTipStartCol
+   local lWasEditing := ::lTipEditing
+   local cText, cCheck, aP, lOK
+
+   if oGet == nil
+      return nil
+   endif
+
+   ::oTipGet := nil
+   oGet:Read()
+   cText := ::cTipValue
+   oGet:End()
+
+   // AllTrim() SOLO saca espacios -- un mensaje multilinea "vacio" en
+   // los hechos (una o mas lineas en blanco, sin texto real) puede
+   // seguir teniendo Chr(13)/Chr(10) sueltos que AllTrim no toca, asi
+   // que Empty( AllTrim( cText ) ) por si solo NO alcanza para
+   // detectarlo -- se arma 'cCheck' reemplazando esos saltos por
+   // espacios antes de decidir si "no hay nada que guardar" (el 'cText'
+   // ORIGINAL, con los saltos intactos, es el que se manda a
+   // Pdf_AnnotAddTip si SI hay contenido real).
+   cCheck := AllTrim( StrTran( StrTran( cText, Chr( 13 ), " " ), Chr( 10 ), " " ) )
+   cText  := AllTrim( cText )
+
+   if ::oViewer != nil .and. ::oViewer:pDoc != nil
+      aP := ::BmpToPagePoint( nRow, nCol )
+
+      if lWasEditing
+         Pdf_AnnotDeleteTipAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
+      endif
+
+      if !Empty( cCheck )
+         lOK := Pdf_AnnotAddTip( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ], cText )
+      else
+         lOK := lWasEditing   // se borro un globo existente -- hay que re-renderizar igual, aunque no se haya agregado nada nuevo
+      endif
+
+      if lOK
+         ::oViewer:RefreshRenderPage( aP[ 1 ] )
+      endif
+   endif
+
+   ::lTipEditing := .F.
+   if ::oViewer != nil
+      ::oViewer:StopDrawMode()
+   endif
+
+return nil
+
+//----------------------------------------------------------------------------//
+// Cancela una entrada de tip a medio escribir (ESC, ver TPdfTipEdit) --
+// destruye el control sin llamar Pdf_AnnotAddTip/Pdf_AnnotDeleteTipAt, no
+// toca nada del documento. Si se estaba EDITANDO un globo existente, este
+// queda intacto tal cual estaba (nunca se llega a borrarlo -- eso solo
+// pasa en CommitTipEntry, al confirmar).
+//----------------------------------------------------------------------------//
+
+METHOD CancelTipEntry() CLASS TPdfBitmap
+
+   local oGet := ::oTipGet
+
+   if oGet != nil
+      ::oTipGet := nil
+      oGet:End()
+   endif
+
+   ::lTipEditing := .F.
+   if ::oViewer != nil
+      ::oViewer:StopDrawMode()
+   endif
+
+return nil
 
 //----------------------------------------------------------------------------//
 // AcroForm: crea el TGet dinamico sobre el campo de texto 'aField' (fila
@@ -1230,6 +1874,18 @@ CLASS TPdfViewer
    METHOD SelectedText()    INLINE if( ::oBmp != NIL, ::oBmp:SelectedText(), "" )
    METHOD HighlightSelection() INLINE if( ::oBmp != NIL, ::oBmp:HighlightSelection(), .F. )
 
+   // Formas libres (Linea/Rectangulo/Circulo/Tinta, ver DESIGN.md) --
+   // NIL = modo normal (seleccion de texto de siempre); "LINE"/"RECT"/
+   // "CIRCLE"/"INK" = modo dibujo armado, consultado por
+   // TPdfBitmap:LButtonDown/MouseMove/LButtonUp. Se desactiva SOLO al
+   // terminar una forma (decision confirmada con Arturo: como Acrobat,
+   // no como AutoCAD/DWGEngine -- evita dejar el modo armado por
+   // accidente mientras el usuario vuelve a leer/seleccionar texto) --
+   // el boton "Normal" (pdf_demo.prg) y ESC tambien lo desarman a mano.
+   DATA cDrawMode INIT NIL
+   METHOD StartDrawMode( cType ) INLINE ::cDrawMode := cType
+   METHOD StopDrawMode()         INLINE ::cDrawMode := NIL
+
    // busqueda (Etapa 5): Find() arranca una busqueda nueva desde la pagina
    // actual; FindNext() avanza al siguiente match (dentro de la misma
    // pagina si quedan mas, si no a la proxima pagina que tenga alguno, con
@@ -1259,7 +1915,17 @@ CLASS TPdfViewer
    // ZoomIn/ZoomOut: RenderCurrentPage + BuildComposite, sirve para
    // ambos modos sin duplicar logica).
    METHOD HitTestField( nPage, x, y )
-   METHOD RefreshRender() INLINE ( ::InvalidatePageCache( ::nCurPage ), ::RenderCurrentPage(), ::BuildComposite() )
+   METHOD RefreshRender() INLINE ::RefreshRenderPage( ::nCurPage )
+   // Igual que RefreshRender() pero invalidando el cache de una pagina
+   // EXPLICITA en vez de asumir ::nCurPage -- hace falta para "borrar
+   // resaltado" en modo continuo, donde el click (y por lo tanto la
+   // pagina que cambio) puede caer en una pagina distinta a la que
+   // ::nCurPage esta trackeando en ese momento (ver LButtonDown,
+   // TPdfBitmap). RenderCurrentPage()/BuildComposite() se llaman igual
+   // que siempre (BuildComposite ya rehace TODAS las paginas frescas en
+   // modo continuo, sin depender del cache -- ver comentario grande en
+   // BuildComposite()).
+   METHOD RefreshRenderPage( nPage ) INLINE ( ::InvalidatePageCache( nPage ), ::RenderCurrentPage(), ::BuildComposite() )
 
    PROTECTED:
 

@@ -21,22 +21,17 @@ function Main()
    local oPdf
    local oSayPage
    local oGetFind
-   // BUG REAL ENCONTRADO (Arturo: "el get no funciona"): un GET de
-   // caracter en Clipper/FiveWin usa Len(uVar) como ancho editable del
-   // buffer -- con "" (longitud 0) no hay NADA en que tipear, sin
-   // importar el SIZE en pixels del control. Tiene que venir pre-rellenado
-   // con Space().
    local cFindText := Space( 60 )
-   local cPdf := "..\tests\enciclopedia de soldadura.pdf"   // TEMPORAL: probando seleccion/busqueda multi-pagina -- ver DESIGN.md 70.1
+   local cPdf := "..\tests\hot corrocion.pdf"   // TEMPORAL: probando seleccion/busqueda multi-pagina -- ver DESIGN.md 70.1
 
    PdfViewLogReset()   // diagnostico TEMPORAL de BuildComposite(), ver pdf_viewer.prg
 
    DEFINE WINDOW oWnd TITLE "PDFEngine32 - " + cPdf ;
-      FROM 0, 0 TO 700, 1000 PIXEL
+      FROM 0, 0 TO 700, 1270 PIXEL
 		
 		DEFINE BUTTONBAR oBar OF oWnd SIZE 45, 24 3D 2007
 		
-		 DEFINE BUTTON OF oBar ;
+		DEFINE BUTTON OF oBar ;
 			 PROMPT "<<" ;
 			 ACTION ( oPdf:FirstPage(), oSayPage:Refresh()   )
 		DEFINE BUTTON OF oBar ;
@@ -82,14 +77,6 @@ function Main()
 			 PROMPT "Sigue" ;
 			 ACTION ( oPdf:FindNext(), oSayPage:Refresh() )
 
-		// AcroForm (ver pdf_form.h/DESIGN.md): sobrescribe el archivo
-		// ABIERTO (oPdf:cFile) con los campos editados -- Arturo eligio
-		// explicitamente que Guardar pise el original (no "guardar como"),
-		// igual que Acrobat; pdf_write.c preserva el original como
-		// "<archivo>.bak" antes de reemplazarlo, asi que nunca se pierde
-		// del todo aunque el escritor nuevo tenga un bug. Confirmacion
-		// simple antes de la primera escritura, dado que es destructivo
-		// sobre el archivo real del usuario.
 		DEFINE BUTTON OF oBar ;
 			 PROMPT "Guardar" ;
 			 ACTION ( IIF( MsgYesNo( "Guardar sobrescribe " + oPdf:cFile + ;
@@ -98,61 +85,70 @@ function Main()
 			               IIF( Pdf_FormSave( oPdf:pDoc, oPdf:cFile ), ;
 			                    MsgInfo( "Guardado." ), ;
 			                    MsgStop( "No se pudo guardar (sin cambios pendientes, o el documento esta encriptado)." ) ), NIL ) )
-
-		// Impresion (ver METHOD PrintDocument() en pdf_viewer.prg):
-		// dialogo nativo de Windows para elegir impresora y rango de
-		// paginas (Todas/Desde-Hasta), manda cada pagina a 300 DPI via
-		// WinAPI directo (StartDoc/StartPage/EndPage/DibDraw).
+	
 		DEFINE BUTTON OF oBar ;
 			 PROMPT "Imprimir" ;
 			 ACTION ( oPdf:PrintDocument() )
 
-		// Rotar (Arturo: "necesito un proceso de rotar pagina 90 grados")
-		// -- suma 90 a la rotacion de vista (::nUserRotate en
-		// pdf_viewer.prg), afecta pantalla Y lo que se manda a imprimir.
 		DEFINE BUTTON OF oBar ;
 			 PROMPT "Rotar" ;
 			 ACTION ( oPdf:RotatePage(), oSayPage:Refresh() )
 
-		// Resaltado de texto (Arturo: "colocar anotaciones de resaltado de
-		// textos", ver DESIGN.md) -- toma la seleccion de texto vigente
-		// (::aSelRanges, arrastre de mouse) y agrega una anotacion real
-		// /Highlight a la pagina (amarillo, 40% Multiply -- sin selector de
-		// color en esta version). Igual que AcroForm: solo muta el
-		// documento EN MEMORIA, el boton "Guardar" (arriba) persiste al
-		// archivo.
 		DEFINE BUTTON OF oBar ;
 			 PROMPT "Resaltar" ;
-			 ACTION ( oPdf:HighlightSelection(), oSayPage:Refresh() )
+			 ACTION ( IIF( oPdf:HighlightSelection(), oSayPage:Refresh(), ;
+			               MsgStop( "No se pudo resaltar (no hay texto seleccionado, o el documento esta encriptado).", ;
+			                        "PDFEngine32" ) ) )
+
+			// Formas libres (Arturo: "formas libres (linea/flecha, rectangulo,
+			// circulo, tinta)" -- ver DESIGN.md). Cada boton solo ARMA el modo
+			// de dibujo (::oViewer:cDrawMode, ver TPdfViewer) -- el dibujo en si
+			// pasa por LButtonDown/MouseMove/LButtonUp de TPdfBitmap
+			// (pdf_viewer.prg), que se desarma solo al terminar una forma. Sin
+			// tildes, misma convencion de todo este archivo (evita problemas de
+			// codificacion entre el editor y el toolchain Harbour/Borland).
+			DEFINE BUTTON OF oBar ;
+				 PROMPT "Linea" ;
+				 ACTION ( oPdf:StartDrawMode( "LINE" ) )
+
+			DEFINE BUTTON OF oBar ;
+				 PROMPT "Rectangulo" ;
+				 ACTION ( oPdf:StartDrawMode( "RECT" ) )
+
+			DEFINE BUTTON OF oBar ;
+				 PROMPT "Circulo" ;
+				 ACTION ( oPdf:StartDrawMode( "CIRCLE" ) )
+
+			DEFINE BUTTON OF oBar ;
+				 PROMPT "Tinta" ;
+				 ACTION ( oPdf:StartDrawMode( "INK" ) )
+
+			// Globo de tip (Arturo: "esquema tipo balloon que permita colocar
+			// mensajes tipo tip" -- ver DESIGN.md). Arma el modo "TIP" -- un
+			// clic en la pagina (no un arrastre, ver LButtonDown de
+			// TPdfBitmap) abre un cuadro de texto ahi mismo para escribir el
+			// mensaje.
+			DEFINE BUTTON OF oBar ;
+				 PROMPT "Tip" ;
+				 ACTION ( oPdf:StartDrawMode( "TIP" ) )
+
+			DEFINE BUTTON OF oBar ;
+				 PROMPT "Normal" ;
+				 ACTION ( oPdf:StopDrawMode() )
 
 
       oPdf := TPdfViewer():New( oWnd, ALTO_TOOLBAR, 0, ;
                                  oWnd:nWidth, oWnd:nHeight - ALTO_TOOLBAR )
-      // TSay():New() -- say.prg linea 31: nRow,nCol,bText,oWnd,cPicture,
-      // oFont,lCentered,lRight,lBorder,lPixels,nClrText,nClrBack,nWidth,
-      // nHeight,... -- BUG REAL ENCONTRADO (la caja oscura de fondo que se
-      // vio en pantalla): faltaban 2 comas vacias entre lPixels y nWidth
-      // (saltando nClrText/nClrBack) para que 110/20 caigan en nWidth/
-      // nHeight y no en nClrText/nClrBack.
-      //
-      // 16 botones ahora (<< < > >> Ajustar 100% Ancho - + Copiar Buscar
-      // Sigue Guardar Imprimir Rotar Resaltar -- 45px cada uno, ver
-      // DEFINE BUTTON arriba), la barra ocupa 16*45=720px -- se corre todo
-      // lo que va DESPUES de ella para no solaparse (la ventana se agrando
-      // a 1000px de ancho, "FROM 0,0 TO 700,1000 PIXEL", para que entre
-      // con margen).
-      oSayPage := TSay():New( 5, 730, ;
+
+      // 22 botones x 45px = 990 -- oSayPage/oGetFind corridos a la derecha
+      // y ventana ensanchada (mismo ajuste ya hecho varias veces antes):
+      // oSayPage_col=990+10, oGetFind_col=oSayPage_col+70,
+      // ancho_ventana=oGetFind_col+200.
+      oSayPage := TSay():New( 5, 1000, ;
          {|| "" + hb_ntos( oPdf:nCurPage ) + " / " + hb_ntos( oPdf:nPageCount ) }, ;
          oWnd, , , , .F., .F., .T., , , 60, 15 )
 
-      // PICTURE es necesaria aca no solo por el formato: FiveWin.ch define
-      // TRES macros distintas para "@ nRow,nCol GET" (lineas 1233/1262/1320)
-      // y sin PICTURE (que solo aceptan las ultimas dos) matcheaba la
-      // PRIMERA (la que arma un TMultiGet, pensado para edicion
-      // MULTILINEA/memo, no para un cuadro de busqueda de una linea) --
-      // sumado al bug de Space() de arriba, entre las dos cosas el GET no
-      // aceptaba texto en absoluto.
-      @ 5, 800 GET oGetFind VAR cFindText PICTURE "@S30" SIZE 150, 20 OF oWnd PIXEL
+      @ 5, 1070 GET oGetFind VAR cFindText PICTURE "@S30" SIZE 150, 20 OF oWnd PIXEL
 
    ACTIVATE WINDOW oWnd ;
       ON INIT ( IIF( oPdf:Open( cPdf ) , oSayPage:Refresh(), ;
