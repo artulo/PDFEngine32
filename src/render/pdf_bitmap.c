@@ -422,6 +422,29 @@ void pdf_bitmap_set_pixel_coverage(pdf_bitmap *bmp, int x, int y,
     if (sa <= 0.0) return;
     if (sa > 1.0) sa = 1.0;
 
+    /* BUG REAL DE RENDIMIENTO (Arturo: "mejorar la velocidad ... con
+     * demasiados graficos", medido contra 3240-3241-2.pdf -- una
+     * pagina escaneada de pagina completa, ~2.5 millones de pixeles
+     * dibujados por esta funcion en un solo "Do" de imagen): el caso
+     * MAS COMUN con enorme diferencia -- pintar 100% opaco, blend
+     * Normal, sin knockout -- de todos modos pasaba por TODA la
+     * mezcla Porter-Duff completa (leer el pixel destino, 4
+     * divisiones de punto flotante para normalizar RGB+alpha viejos,
+     * blend_channel, y la formula general de composicion con otra
+     * division mas) para terminar dando, algebraicamente, el mismo
+     * resultado que un simple reemplazo del pixel. Ese caso especial
+     * se resuelve aca directo, sin tocar el pixel destino para nada. */
+    if (sa >= 1.0 && bmp->blend_mode == PDF_BLEND_NORMAL &&
+        !(bmp->knockout && bmp->knockout_mask != NULL))
+    {
+        p = bmp->pixels + (long)y * bmp->stride + (long)x * 3;
+        p[0] = clamp_u8(c.r);
+        p[1] = clamp_u8(c.g);
+        p[2] = clamp_u8(c.b);
+        bmp->alpha[(long)y * bmp->width + x] = 255;
+        return;
+    }
+
     p = bmp->pixels + (long)y * bmp->stride + (long)x * 3;
     dr = (double)p[0] / 255.0;
     dg = (double)p[1] / 255.0;
@@ -462,6 +485,47 @@ void pdf_bitmap_set_pixel_coverage(pdf_bitmap *bmp, int x, int y,
     bmp->alpha[(long)y * bmp->width + x] = clamp_u8(oa);
     if (bmp->knockout && bmp->knockout_mask != NULL && sa > 0.0)
         bmp->knockout_mask[(long)y * bmp->knockout_mask_stride + x] = 255;
+}
+
+void pdf_bitmap_set_pixel_rgb_u8(pdf_bitmap *bmp, int x, int y,
+                                 unsigned char r, unsigned char g, unsigned char b)
+{
+    unsigned char *p;
+    double sa;
+
+    if (bmp == NULL || bmp->pixels == NULL || bmp->alpha == NULL) return;
+    if (x < 0 || y < 0 || x >= bmp->width || y >= bmp->height) return;
+    if (x < bmp->clip_x0 || x >= bmp->clip_x1 || y < bmp->clip_y0 || y >= bmp->clip_y1) return;
+
+    sa = bmp->opacity;
+    if (bmp->clip_mask != NULL)
+        sa *= (double)bmp->clip_mask[y * bmp->clip_mask_stride + x] / 255.0;
+    if (bmp->soft_mask != NULL)
+        sa *= (double)bmp->soft_mask[y * bmp->soft_mask_stride + x] / 255.0;
+    if (sa <= 0.0) return;
+
+    /* mismo atajo que pdf_bitmap_set_pixel_coverage -- si ademas de
+     * opaco es Normal/sin-knockout, el resultado final es un simple
+     * reemplazo de pixel: como el dato YA es byte, se escribe directo,
+     * sin ida-y-vuelta a double. */
+    if (sa >= 1.0 && bmp->blend_mode == PDF_BLEND_NORMAL &&
+        !(bmp->knockout && bmp->knockout_mask != NULL))
+    {
+        p = bmp->pixels + (long)y * bmp->stride + (long)x * 3;
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        bmp->alpha[(long)y * bmp->width + x] = 255;
+        return;
+    }
+
+    /* caso raro (soft mask / clip mask / blend mode no-Normal / grupo
+     * con knockout activo): cae al camino general de siempre. */
+    {
+        pdf_color c;
+        c.r = r / 255.0; c.g = g / 255.0; c.b = b / 255.0;
+        pdf_bitmap_set_pixel_coverage(bmp, x, y, c, 1.0);
+    }
 }
 
 void pdf_bitmap_copy(pdf_bitmap *dst, const pdf_bitmap *src)

@@ -8,6 +8,24 @@
 #include <math.h>
 #include <string.h>
 
+/* Un punto NaN/Infinito (CTM degenerado en el content stream -- ver
+ * BUG REAL en stroke_segment_thick mas abajo) nunca debe llegar a un
+ * cast a int ("(int)(p.x+0.5)", limites de scanline, etc.): eso es
+ * comportamiento indefinido en C, y en la practica dispara un DOMAIN
+ * error de sqrt() o un crash/loop segun el caso. Filtrar aca, en el
+ * unico punto de entrada real de coordenadas de punto flotante al
+ * rasterizador. */
+static int pdf_point_finite(double x, double y)
+{
+    /* 1e7 pixels de margen -- muy por encima de cualquier bitmap de
+     * pagina real, pero MUY por debajo del punto en que un cuadrado
+     * intermedio (x*x en fill_convex_quad/stroke_segment_thick) se
+     * acerca al desbordamiento de un double (~1e308) -- un umbral
+     * como 1e300 dejaba pasar valores que igual desbordaban mas
+     * adelante en un calculo intermedio. */
+    return (x >= -1e7 && x <= 1e7 && y >= -1e7 && y <= 1e7);
+}
+
 /* --- trazo (stroke): Bresenham, 1px, sin grosor variable ---------------- */
 
 static void pdf_raster_line(pdf_bitmap *bmp, int x0, int y0, int x1, int y1, pdf_color c)
@@ -50,6 +68,8 @@ void pdf_raster_stroke_path(pdf_bitmap *bmp, const pdf_path *path, pdf_color c)
         {
             pdf_path_point p0 = path->points[start + i];
             pdf_path_point p1 = path->points[start + i + 1];
+            if (!pdf_point_finite(p0.x, p0.y) || !pdf_point_finite(p1.x, p1.y))
+                continue;
             pdf_raster_line(bmp, (int)(p0.x + 0.5), (int)(p0.y + 0.5),
                                   (int)(p1.x + 0.5), (int)(p1.y + 0.5), c);
         }
@@ -58,8 +78,9 @@ void pdf_raster_stroke_path(pdf_bitmap *bmp, const pdf_path *path, pdf_color c)
         {
             pdf_path_point p0 = path->points[start + len - 1];
             pdf_path_point p1 = path->points[start];
-            pdf_raster_line(bmp, (int)(p0.x + 0.5), (int)(p0.y + 0.5),
-                                  (int)(p1.x + 0.5), (int)(p1.y + 0.5), c);
+            if (pdf_point_finite(p0.x, p0.y) && pdf_point_finite(p1.x, p1.y))
+                pdf_raster_line(bmp, (int)(p0.x + 0.5), (int)(p0.y + 0.5),
+                                      (int)(p1.x + 0.5), (int)(p1.y + 0.5), c);
         }
     }
 }
@@ -116,9 +137,26 @@ static void fill_convex_quad(pdf_bitmap *bmp, const double *qx, const double *qy
 static void stroke_segment_thick(pdf_bitmap *bmp, double x0, double y0,
                                   double x1, double y1, double hw, pdf_color c)
 {
-    double dx = x1 - x0, dy = y1 - y0;
-    double len = sqrt(dx * dx + dy * dy);
-    double nx, ny, qx[4], qy[4];
+    double dx, dy, len, nx, ny, qx[4], qy[4];
+
+    /* BUG REAL ENCONTRADO (Arturo: "se introducen lineas que no
+     * corresponden" en D-6025IC1r0.pdf -- el fix de subpath_overflow
+     * de pdf_path.c destapo este otro, preexistente: un CTM degenerado
+     * en algun punto del content stream (un "cm" casi-singular, comun
+     * en el "texto de una sola linea" que exporta AutoCAD) produce
+     * coordenadas NaN/Infinito para algunos puntos. sqrt() de un
+     * NaN/Infinito dispara el manejador DOMAIN error de la runtime de
+     * bcc32, y castear ese Infinito/NaN a int mas abajo (en
+     * fill_convex_quad, para el rango de scanlines) es UB -- crash o
+     * loop segun el caso. Antes nunca se notaba: con el cupo de
+     * subpaths viejo (256, ver pdf_path.h) el path se truncaba ANTES
+     * de llegar a estos puntos. Con el cupo mas alto, degradar (no
+     * dibujar este segmento) en vez de propagar el NaN/Infinito. */
+    if (!pdf_point_finite(x0, y0) || !pdf_point_finite(x1, y1))
+        return;
+
+    dx = x1 - x0; dy = y1 - y0;
+    len = sqrt(dx * dx + dy * dy);
 
     if (len < 1e-9) { nx = hw; ny = 0.0; }
     else            { nx = -dy / len * hw; ny = dx / len * hw; }

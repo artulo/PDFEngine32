@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* ---- utilidades big-endian (mismo idioma que jpx_u16/jpx_u32 en
  * pdf_jpx.c y el parseo inline de pdf_font.c -- sin helper compartido
@@ -262,7 +263,33 @@ int pdf_ttf_gid_for_symbol_code(const pdf_ttf_font *font, int code)
 
 #define PDF_TTF_MAX_CONTOURS      64
 #define PDF_TTF_MAX_GLYPH_POINTS  512
-#define PDF_TTF_QUAD_SEGMENTS     8
+/* BUG REAL DE RENDIMIENTO (Arturo: "esta lento cuando se abre el
+ * archivo" -- 2006-ThermodynamicModelling...TMS-2.pdf, un paper
+ * academico de 8 paginas con muchisimo texto en Times/Helvetica
+ * SIN fuente embebida -- sustituto de sistema TrueType, ver
+ * resolve_glyph en pdf_render.c). Medido con un harness temporal:
+ * ~2657 glyphs de una sola pagina promediaban 175 PUNTOS cada uno
+ * (maximo 446) porque 'quad_flatten' subdividia CADA curva
+ * cuadratica en un numero FIJO de segmentos de recta
+ * (PDF_TTF_QUAD_SEGMENTS=8), sin importar el tamanio real en
+ * pantalla del glyph -- un texto de cuerpo normal (9-12pt) mide
+ * apenas 5-10 PIXELES de alto, para el que 8 segmentos por curva es
+ * enormemente mas detalle del que se puede ver, pero el costo de
+ * `pdf_raster_fill_path_aa` escala con la cantidad de puntos (cada
+ * punto se chequea contra cada sub-scanline del glyph). Bajar el
+ * fijo a un valor chico (probado: 3) da ~2x mas rapido de punta a
+ * punta para esta pagina, pero deja texto grande/zoom alto con
+ * curvas visiblemente facetadas. Fix real: PDF_TTF_QUAD_SEGMENTS_MAX
+ * es ahora el TOPE (mismo valor de siempre, 8 -- ningun caso pierde
+ * calidad respecto de antes), pero la cantidad REAL de segmentos por
+ * curva se calcula en 'quad_segment_count()' de abajo en base al
+ * tamanio ESTIMADO en pixeles de esa curva especifica (bajado por el
+ * llamador via 'px_per_em', ver pdf_ttf_glyph_outline) -- una curva
+ * de 2 pixels de largo en pantalla usa 1 segmento, una curva grande
+ * (zoom alto) sigue usando hasta 8. */
+#define PDF_TTF_QUAD_SEGMENTS_MAX 8
+#define PDF_TTF_QUAD_SEGMENTS_MIN 1
+#define PDF_TTF_QUAD_PX_PER_SEGMENT 3.0
 
 typedef struct raw_pt_s { double x, y; } raw_pt;
 
@@ -292,16 +319,42 @@ static int get_glyph_range(const pdf_ttf_font *font, int gid, long *off, long *l
     return 1;
 }
 
+/* Cantidad de segmentos a usar para ESTA curva puntual, en base a su
+ * longitud de cuerda ESTIMADA en pixeles de pantalla (ver comentario
+ * grande de PDF_TTF_QUAD_SEGMENTS_MAX arriba). 'px_per_em' <= 0
+ * significa "tamanio de pantalla desconocido" (p.ej. un llamador que
+ * no le importa el rendimiento, o que use el motor fuera del camino
+ * de render a pantalla) -- ahi se usa siempre el maximo, IDENTICO al
+ * comportamiento fijo de antes de este fix, cero riesgo para esos
+ * casos. */
+static int quad_segment_count(double x0, double y0, double x1, double y1,
+                               double inv_upm, double px_per_em)
+{
+    double chord_em, chord_px;
+    int segs;
+
+    if (px_per_em <= 0.0) return PDF_TTF_QUAD_SEGMENTS_MAX;
+
+    chord_em = sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) * inv_upm;
+    chord_px = chord_em * px_per_em;
+
+    segs = (int)(chord_px / PDF_TTF_QUAD_PX_PER_SEGMENT + 0.5);
+    if (segs < PDF_TTF_QUAD_SEGMENTS_MIN) segs = PDF_TTF_QUAD_SEGMENTS_MIN;
+    if (segs > PDF_TTF_QUAD_SEGMENTS_MAX) segs = PDF_TTF_QUAD_SEGMENTS_MAX;
+    return segs;
+}
+
 /* subdivide la cuadratica (x0,y0)-(cx,cy)-(x1,y1) (unidades crudas de
- * fuente) en PDF_TTF_QUAD_SEGMENTS segmentos de recta, emitidos ya
+ * fuente) en una cantidad de segmentos de recta ADAPTADA al tamanio en
+ * pantalla de la curva (ver quad_segment_count arriba), emitidos ya
  * normalizados a em (1.0 = un em) via 'lineto'. */
 static void quad_flatten(double x0, double y0, double cx, double cy, double x1, double y1,
-                          double inv_upm, pdf_ttf_lineto_fn lineto, void *user)
+                          double inv_upm, double px_per_em, pdf_ttf_lineto_fn lineto, void *user)
 {
-    int i;
-    for (i = 1; i <= PDF_TTF_QUAD_SEGMENTS; i++)
+    int i, n_segs = quad_segment_count(x0, y0, x1, y1, inv_upm, px_per_em);
+    for (i = 1; i <= n_segs; i++)
     {
-        double t  = (double)i / (double)PDF_TTF_QUAD_SEGMENTS;
+        double t  = (double)i / (double)n_segs;
         double mt = 1.0 - t;
         double x  = mt * mt * x0 + 2.0 * mt * t * cx + t * t * x1;
         double y  = mt * mt * y0 + 2.0 * mt * t * cy + t * t * y1;
@@ -316,6 +369,7 @@ static void quad_flatten(double x0, double y0, double cx, double cy, double x1, 
  * (equivalente al usado por FreeType/stb_truetype para este mismo
  * paso), sin atajos. */
 static void emit_contour(const raw_pt *pts, const int *on_curve, int n, double inv_upm,
+                          double px_per_em,
                           pdf_ttf_moveto_fn moveto, pdf_ttf_lineto_fn lineto, void *user)
 {
     int start_idx;
@@ -344,7 +398,7 @@ static void emit_contour(const raw_pt *pts, const int *on_curve, int n, double i
         {
             if (have_ctrl)
             {
-                quad_flatten(cx, cy, ctrl_x, ctrl_y, px, py, inv_upm, lineto, user);
+                quad_flatten(cx, cy, ctrl_x, ctrl_y, px, py, inv_upm, px_per_em, lineto, user);
                 have_ctrl = 0;
             }
             else
@@ -358,7 +412,7 @@ static void emit_contour(const raw_pt *pts, const int *on_curve, int n, double i
             if (have_ctrl)
             {
                 double mx = (ctrl_x + px) * 0.5, my = (ctrl_y + py) * 0.5;
-                quad_flatten(cx, cy, ctrl_x, ctrl_y, mx, my, inv_upm, lineto, user);
+                quad_flatten(cx, cy, ctrl_x, ctrl_y, mx, my, inv_upm, px_per_em, lineto, user);
                 cx = mx; cy = my;
             }
             ctrl_x = px; ctrl_y = py;
@@ -367,12 +421,13 @@ static void emit_contour(const raw_pt *pts, const int *on_curve, int n, double i
     }
 
     if (have_ctrl)
-        quad_flatten(cx, cy, ctrl_x, ctrl_y, sx, sy, inv_upm, lineto, user);
+        quad_flatten(cx, cy, ctrl_x, ctrl_y, sx, sy, inv_upm, px_per_em, lineto, user);
     else if (cx != sx || cy != sy)
         lineto(user, sx * inv_upm, sy * inv_upm);
 }
 
 static int decode_simple_glyph(const unsigned char *g, long glen, double inv_upm,
+                                double px_per_em,
                                 pdf_ttf_moveto_fn moveto, pdf_ttf_lineto_fn lineto, void *user)
 {
     int num_contours;
@@ -478,7 +533,7 @@ static int decode_simple_glyph(const unsigned char *g, long glen, double inv_upm
         int cend = end_pts[c];
         int n = cend - start + 1;
         if (n > 0)
-            emit_contour(&pts[start], &on_curve[start], n, inv_upm, moveto, lineto, user);
+            emit_contour(&pts[start], &on_curve[start], n, inv_upm, px_per_em, moveto, lineto, user);
         start = cend + 1;
     }
 
@@ -510,10 +565,11 @@ static void comp_lineto(void *u, double x, double y)
 
 int pdf_ttf_glyph_outline(const pdf_ttf_font *font, int gid,
                            pdf_ttf_moveto_fn moveto, pdf_ttf_lineto_fn lineto,
-                           void *user, int depth);
+                           void *user, int depth, double px_per_em);
 
 static int decode_composite_glyph(const pdf_ttf_font *font, const unsigned char *g, long glen,
-                                   double inv_upm, pdf_ttf_moveto_fn moveto, pdf_ttf_lineto_fn lineto,
+                                   double inv_upm, double px_per_em,
+                                   pdf_ttf_moveto_fn moveto, pdf_ttf_lineto_fn lineto,
                                    void *user, int depth)
 {
     long pos = 10;
@@ -573,7 +629,7 @@ static int decode_composite_glyph(const pdf_ttf_font *font, const unsigned char 
         cc.a = a; cc.b = b; cc.c = c; cc.d = d;
         cc.dx = (flags & 0x0002) ? arg1 * inv_upm : 0.0;
         cc.dy = (flags & 0x0002) ? arg2 * inv_upm : 0.0;
-        pdf_ttf_glyph_outline(font, (int)glyph_index, comp_moveto, comp_lineto, &cc, depth + 1);
+        pdf_ttf_glyph_outline(font, (int)glyph_index, comp_moveto, comp_lineto, &cc, depth + 1, px_per_em);
 
         more = (flags & 0x0020) ? 1 : 0; /* MORE_COMPONENTS */
     }
@@ -583,7 +639,7 @@ static int decode_composite_glyph(const pdf_ttf_font *font, const unsigned char 
 
 int pdf_ttf_glyph_outline(const pdf_ttf_font *font, int gid,
                            pdf_ttf_moveto_fn moveto, pdf_ttf_lineto_fn lineto,
-                           void *user, int depth)
+                           void *user, int depth, double px_per_em)
 {
     long goff, glen;
     int num_contours;
@@ -601,9 +657,9 @@ int pdf_ttf_glyph_outline(const pdf_ttf_font *font, int gid,
     num_contours = (int)(short)be16(font->data + goff);
 
     if (num_contours >= 0)
-        return decode_simple_glyph(font->data + goff, glen, inv_upm, moveto, lineto, user);
+        return decode_simple_glyph(font->data + goff, glen, inv_upm, px_per_em, moveto, lineto, user);
 
-    return decode_composite_glyph(font, font->data + goff, glen, inv_upm, moveto, lineto, user, depth);
+    return decode_composite_glyph(font, font->data + goff, glen, inv_upm, px_per_em, moveto, lineto, user, depth);
 }
 
 double pdf_ttf_glyph_advance_em(const pdf_ttf_font *font, int gid)

@@ -15,98 +15,125 @@
 
 #define ALTO_TOOLBAR   26
 
+static oWnd 
+static oPdf,oSayPage 
+static obar,npage,opage,nPageFin,oPageFin,ofont,cPdf
+
 function Main()
-
-   local oWnd,oBar
-   local oPdf
-   local oSayPage
-   local oGetFind
-   local cFindText := Space( 60 )
-   local cPdf := "..\tests\hot corrocion.pdf"   // TEMPORAL: probando seleccion/busqueda multi-pagina -- ver DESIGN.md 70.1
-
-   PdfViewLogReset()   // diagnostico TEMPORAL de BuildComposite(), ver pdf_viewer.prg
-
-   DEFINE WINDOW oWnd TITLE "PDFEngine32 - " + cPdf ;
-      FROM 0, 0 TO 700, 1270 PIXEL
+	local oIco
+	Local nrow,ncol,wsearch:=space(50),osearch
+	
+	DEFINE FONT oFont NAME "MS Sans Serif" SIZE 0, -9 
+	DEFINE ICON oIco RESOURCE "LOGO"
+	 
+	PdfViewLogReset()   // diagnostico de BuildComposite(), opt-in via PDFVIEW_DEBUG_LOG -- ver pdf_viewer.prg
+	nPage:=0
+	nPageFin:=0
+	DEFINE WINDOW oWnd TITLE "PDFEngine32 - "   ;
+		FROM 0, 0 TO 700, 1270 PIXEL;
+			MENU BuildMenu() ;
+			ICON oIco
 		
-		DEFINE BUTTONBAR oBar OF oWnd SIZE 45, 24 3D 2007
-		
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "<<" ;
-			 ACTION ( oPdf:FirstPage(), oSayPage:Refresh()   )
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "<" ;
-			 ACTION ( oPdf:PrevPage(),  oSayPage:Refresh()   ) 
-			 
-		DEFINE BUTTON OF oBar ;
-			 PROMPT ">" ;
-			 ACTION (  oPdf:NextPage(),  oSayPage:Refresh() ) 
-		DEFINE BUTTON OF oBar ;
-			 PROMPT ">>" ;
-			 ACTION ( oPdf:LastPage(),  oSayPage:Refresh()   )
-		
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Ajustar" ;
-			 ACTION ( oPdf:SetZoomFitHeight()  )
+		DEFINE BUTTONBAR oBar OF oWnd SIZE 30, 30 3D 2007
+			DEFINE BUTTON OF obar;
+				RESOURCE "ICON_16_OPEN";
+				ACTION (cargapdf()); //,Npage:=1,nPageFin:=oPdf:nPageCount,Opage:refresh(),OpageFin:refresh());
+				NOBORDER //;
 
 		DEFINE BUTTON OF oBar ;
-			 PROMPT "100%" ;
-			 ACTION ( oPdf:SetZoom100()   )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Ancho" ;
-			 ACTION ( oPdf:SetZoomFitWidth()   )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "-" ;
-			 ACTION ( oPdf:ZoomOut()   )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "+" ;
-			 ACTION ( oPdf:ZoomIn()   )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Copiar" ;
-			 ACTION ( oPdf:CopySelection()   )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Buscar" ;
-			 ACTION ( oPdf:Find( AllTrim( cFindText ), .F. ), oSayPage:Refresh() )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Sigue" ;
-			 ACTION ( oPdf:FindNext(), oSayPage:Refresh() )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Guardar" ;
-			 ACTION ( IIF( MsgYesNo( "Guardar sobrescribe " + oPdf:cFile + ;
+			RESOURCE "ICON_16_SAVE";
+			ACTION ( IIF( MsgYesNo( "Guardar sobrescribe " + oPdf:cFile + ;
 			                          Chr(13) + "(el original queda como .bak). Continuar?", ;
 			                          "PDFEngine32" ), ;
 			               IIF( Pdf_FormSave( oPdf:pDoc, oPdf:cFile ), ;
 			                    MsgInfo( "Guardado." ), ;
 			                    MsgStop( "No se pudo guardar (sin cambios pendientes, o el documento esta encriptado)." ) ), NIL ) )
+		
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "ICON_16_PRINT";
+			ACTION ( oPdf:PrintDocument() )
+	    
+		nrow := Obar:nTop +.5
+		ncol := oBar:nLeft + 15
+		
+		@ nRow, nCol SAY "P�gina:" OF oBar SIZE 35,20 FONT oFont
+ 
+		@ nRow, nCol+1.5 GET opage VAR nPage OF obar PICTURE "9999" SIZE 35,20 FONT oFont;
+						 VALID (Getpagina(@npage,oPage,@nPageFin,oPdf),opdf:refresh(),.t.)
+
+		@ nRow, nCol+13 SAY "/" OF oBar SIZE 5,20 FONT oFont
+
+		@ nRow, nCol+15.5 SAY opagefin VAR nPagefin OF obar SIZE 35,20 FONT oFont
+
+		DEFINE BUTTON OF oBar GROUP ;
+			RESOURCE "A_04"; 
+			ACTION ( oPdf:FirstPage(), ( nPage:=oPdf:nCurPage, oPage:Refresh() )   )
+		
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "A_02";
+			ACTION ( oPdf:PrevPage(),  ( nPage:=oPdf:nCurPage, oPage:Refresh() )   ) 
+			 
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "A_03";
+			ACTION (  oPdf:NextPage(),  ( nPage:=oPdf:nCurPage, oPage:Refresh() ) ) 
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "A_05";
+			ACTION ( oPdf:LastPage(), ( nPage:=oPdf:nCurPage, oPage:Refresh() )   )
+		
+		DEFINE BUTTON OF oBar GROUP;
+			RESOURCE "W2";
+			ACTION ( oPdf:SetZoomFitHeight()  )
+
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "Z7" ;
+			ACTION ( oPdf:SetZoom100()   )
+
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "W1" ;
+			ACTION ( oPdf:SetZoomFitWidth()   )
+
+		DEFINE BUTTON OF oBar GROUP;
+			RESOURCE "ICON_16_ZOOOUT" ;
+			ACTION ( oPdf:ZoomOut()   )
+
+		DEFINE BUTTON OF oBar ;
+			 RESOURCE "ICON_16_ZOOIN";
+			 ACTION ( oPdf:ZoomIn()   )
+		
+
+		DEFINE BUTTON OF oBar group ;
+			RESOURCE "Z1" ;
+			ACTION ( oPdf:RotatePage( -90 ), ( nPage:=oPdf:nCurPage, oPage:Refresh() ) )
+
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "Z2";
+			ACTION ( oPdf:RotatePage( 90 ), ( nPage:=oPdf:nCurPage, oPage:Refresh() ) )
+  
+		@ nRow, nCol+80 SAY "Buscar:" OF oBar SIZE 35,20 FONT oFont
+	 	@ nRow, nCol+62 GET oSearch VAR wSearch OF obar  SIZE 80,20 FONT oFont
+
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "Z5" ;
+			ACTION ( oPdf:SearchPrev( AllTrim( wSearch ), .F. ), ( nPage:=oPdf:nCurPage, oPage:Refresh() ) )
+
+		DEFINE BUTTON OF oBar ;
+			RESOURCE "Z6" ;
+			ACTION ( oPdf:SearchNext( AllTrim( wSearch ), .F. ), ( nPage:=oPdf:nCurPage, oPage:Refresh() ) )
+
+		DEFINE BUTTON OF oBar GROUP;
+			RESOURCE "ICON_16_COPY";
+			ACTION ( oPdf:CopySelection()   )
+
+
+
 	
 		DEFINE BUTTON OF oBar ;
-			 PROMPT "Imprimir" ;
-			 ACTION ( oPdf:PrintDocument() )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Rotar" ;
-			 ACTION ( oPdf:RotatePage(), oSayPage:Refresh() )
-
-		DEFINE BUTTON OF oBar ;
-			 PROMPT "Resaltar" ;
-			 ACTION ( IIF( oPdf:HighlightSelection(), oSayPage:Refresh(), ;
+			PROMPT "Resaltar" ;
+			ACTION ( IIF( oPdf:HighlightSelection(), ( nPage:=oPdf:nCurPage, oPage:Refresh() ), ;
 			               MsgStop( "No se pudo resaltar (no hay texto seleccionado, o el documento esta encriptado).", ;
 			                        "PDFEngine32" ) ) )
 
-			// Formas libres (Arturo: "formas libres (linea/flecha, rectangulo,
-			// circulo, tinta)" -- ver DESIGN.md). Cada boton solo ARMA el modo
-			// de dibujo (::oViewer:cDrawMode, ver TPdfViewer) -- el dibujo en si
-			// pasa por LButtonDown/MouseMove/LButtonUp de TPdfBitmap
-			// (pdf_viewer.prg), que se desarma solo al terminar una forma. Sin
-			// tildes, misma convencion de todo este archivo (evita problemas de
-			// codificacion entre el editor y el toolchain Harbour/Borland).
+
 			DEFINE BUTTON OF oBar ;
 				 PROMPT "Linea" ;
 				 ACTION ( oPdf:StartDrawMode( "LINE" ) )
@@ -123,11 +150,6 @@ function Main()
 				 PROMPT "Tinta" ;
 				 ACTION ( oPdf:StartDrawMode( "INK" ) )
 
-			// Globo de tip (Arturo: "esquema tipo balloon que permita colocar
-			// mensajes tipo tip" -- ver DESIGN.md). Arma el modo "TIP" -- un
-			// clic en la pagina (no un arrastre, ver LButtonDown de
-			// TPdfBitmap) abre un cuadro de texto ahi mismo para escribir el
-			// mensaje.
 			DEFINE BUTTON OF oBar ;
 				 PROMPT "Tip" ;
 				 ACTION ( oPdf:StartDrawMode( "TIP" ) )
@@ -140,20 +162,61 @@ function Main()
       oPdf := TPdfViewer():New( oWnd, ALTO_TOOLBAR, 0, ;
                                  oWnd:nWidth, oWnd:nHeight - ALTO_TOOLBAR )
 
-      // 22 botones x 45px = 990 -- oSayPage/oGetFind corridos a la derecha
-      // y ventana ensanchada (mismo ajuste ya hecho varias veces antes):
-      // oSayPage_col=990+10, oGetFind_col=oSayPage_col+70,
-      // ancho_ventana=oGetFind_col+200.
-      oSayPage := TSay():New( 5, 1000, ;
-         {|| "" + hb_ntos( oPdf:nCurPage ) + " / " + hb_ntos( oPdf:nPageCount ) }, ;
-         oWnd, , , , .F., .F., .T., , , 60, 15 )
+      oPdf:bOnPageChange := {| n | ( nPage := n, oPage:Refresh() ) }
 
-      @ 5, 1070 GET oGetFind VAR cFindText PICTURE "@S30" SIZE 150, 20 OF oWnd PIXEL
 
-   ACTIVATE WINDOW oWnd ;
-      ON INIT ( IIF( oPdf:Open( cPdf ) , oSayPage:Refresh(), ;
-                     MsgStop( "No se pudo abrir " + cPdf, "PDFEngine32" ) ) ) ;
+   ACTIVATE WINDOW oWnd MAXIMIZED;
       ON RESIZE ( oPdf:Resize( nWidth, nHeight - ALTO_TOOLBAR ) ) ;
       VALID ( oPdf:Close(), .T. )
-
+	  
+	  /*
+	        ON INIT ( IIF( oPdf:Open( cPdf ) , oSayPage:Refresh(), ;
+                     MsgStop( "No se pudo abrir " + cPdf, "PDFEngine32" ) ) ) ;*/
 return nil
+//----------------------------------------------------------------------------//
+Static Function BuildMenu()
+
+   Local oMenu
+
+   MENU oMenu
+      MENUITEM "&Abrir" ACTION ( if(cargapdf(),( Npage:=1,nPageFin:=Opdf:NPageCount,Opage:refresh(),OpageFin:refresh(),obar:refresh() ),.f.) )
+      MENUITEM "&Salir" ACTION (ownd:End())
+   ENDMENU
+
+Return oMenu
+//--------------------------------------//
+Function CargaPdf(nfile) 
+    
+	if empty(nfile)
+		cPdf=cGetFile( "*.pdf", "Favor selecione un pdf file" )
+		if empty(cPdf)
+			Return .f.
+		endif
+	endif
+	if !File(cPdf)
+		Return .f.
+	else
+	//	oPdf:SetZoomFitHeight() 
+		oPdf:Close()
+	endif
+	oPdf:Open( cPdf )
+	oPdf:SetZoomFitHeight() 
+	//opdf:refresh()
+	Npage:=1
+	nPageFin:=Opdf:nPageCount
+	Opage:refresh()
+	OpageFin:refresh()
+return .t.
+//----------------------------------------------------------------------------//
+Function Getpagina(npage,oPage,nPageFin,oPdf)
+
+   iF nPage > nPageFin
+      npage:=npagefin
+   endif
+   iF nPage < 1
+      npage:=1
+   endif
+   opdf:gotopage(npage)
+   opage:refresh()
+
+return .t.

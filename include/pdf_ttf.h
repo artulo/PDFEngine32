@@ -94,6 +94,17 @@ typedef void (*pdf_ttf_lineto_fn)(void *user, double x, double y);
  * con fuentes corruptas/circulares, igual espiritu que 'form_depth' en
  * pdf_render_device; profundidad maxima interna: 8).
  *
+ * 'px_per_em' (ver DESIGN.md seccion 89): tamanio ESTIMADO en pixeles
+ * de un em de esta fuente en el render actual (el llamador lo calcula
+ * de la escala de la matriz de texto/CTM vigente) -- controla cuantos
+ * segmentos de recta se usan para aplanar cada curva cuadratica
+ * (menos segmentos para texto chico en pantalla, que no los necesita;
+ * hasta 8 para texto grande/zoom alto, igual que antes de este fix).
+ * Pasar <= 0.0 (tamanio de pantalla desconocido) usa siempre el
+ * maximo -- comportamiento IDENTICO al de antes de esta ronda, sin
+ * ningun cambio de calidad, para cualquier llamador que no le importe
+ * el costo (o que no tenga forma facil de estimar el tamanio real).
+ *
  * Devuelve PDF_OK si se emitio al menos un contorno, PDF_ERR_NOTFOUND
  * si 'gid' es 0/.notdef o esta fuera de rango (glyph vacio, comun para
  * espacio -- no es un error real, el llamador simplemente no dibuja
@@ -101,7 +112,7 @@ typedef void (*pdf_ttf_lineto_fn)(void *user, double x, double y);
  * son invalidos -- en NINGUN caso crashea. */
 int pdf_ttf_glyph_outline(const pdf_ttf_font *font, int gid,
                            pdf_ttf_moveto_fn moveto, pdf_ttf_lineto_fn lineto,
-                           void *user, int depth);
+                           void *user, int depth, double px_per_em);
 
 /* BUG REAL ENCONTRADO (render de fuentes real, confirmado contra
  * Utilization_and_efficiency_of_ground_gra.pdf): dibujar el contorno

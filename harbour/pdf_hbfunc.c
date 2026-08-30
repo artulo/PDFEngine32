@@ -185,21 +185,9 @@ static pdf_font *hb_doc_font_cache_fn(void *user, pdf_obj *fdict,
     return font;
 }
 
-/* BUG REAL ENCONTRADO (fase de resaltado de texto -- Arturo: "Guardar
- * dice que no hay cambios pendientes" pese a que el resaltado SI se
- * veia en pantalla, osea SI se habia mutado 'page_obj'/'annots' bien):
- * esta funcion ya tenia el patron EXACTO de la miscompilacion de bcc32
- * 7.70 documentada extensamente en este proyecto (ver DESIGN.md,
- * pdf_xref.c/pdf_object.c/pdf_render.c) -- 3 escrituras DIRECTAS
- * consecutivas a campos ADYACENTES de un struct (`h->touched[...]
- * .obj_num/.obj_gen/.obj_ptr`) seguidas de un incremento
- * (`h->n_touched++`). Era codigo YA EXISTENTE de la fase de AcroForm,
- * nunca antes disparado de forma detectable -- el resaltado de texto
- * parece haber sido el primer camino que lo hizo manifestarse de forma
- * reproducible (probablemente por la asignacion de registros/orden de
- * evaluacion particular que genera esta nueva secuencia de llamadas).
- * Mismo fix ya establecido en todo el resto del motor: memcpy() desde
- * variables locales en vez de asignacion directa a campos adyacentes. */
+/* Escribe via memcpy() (no asignacion directa a campos adyacentes de
+ * `h->touched[...]`) -- mismo fix preventivo de la miscompilacion de
+ * bcc32 7.70 ya establecido en todo el motor, ver DESIGN.md. */
 static void mark_touched(pdf_hb_doc *h, long obj_num, long obj_gen, pdf_obj *obj_ptr)
 {
     int i;
@@ -2356,16 +2344,10 @@ HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
         return;
     }
 
-    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
-     * calculo que PDF_GETPAGESIZEPT/PDF_RENDERTOHBITMAP/
-     * pdf_text_extract_page (4 copias del mismo bloque en el motor,
-     * cada una con este comentario cruzado -- si se corrige un bug aca
-     * corregirlo en las otras 3 tambien). A diferencia de esas, NO se
-     * intercambian ancho/alto para /Rotate 90/270: 'page_w'/'page_h'
-     * tienen que ser las dimensiones NATIVAS (sin rotar), que es lo que
-     * espera pdf_render_topdown_to_native() (mismo criterio que
-     * dev->page_width_pt/page_height_pt en pdf_render.c, que tampoco
-     * se intercambian). */
+    /* /CropBox intersectado con /MediaBox + /Rotate heredado -- mismo
+     * calculo duplicado en varios sitios de este archivo (ver
+     * PDF_GETPAGESIZEPT). Dimensiones NATIVAS, sin swap ancho/alto para
+     * 90/270 (pdf_render_topdown_to_native lo espera asi). */
     mediabox = pdf_dict_get(page_obj, "MediaBox");
     if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
     {
@@ -2469,35 +2451,13 @@ HB_FUNC(PDF_ANNOTADDHIGHLIGHT)
         return;
     }
 
-    /* BUG REAL ENCONTRADO Y ARREGLADO (Arturo: "resaltar no marca
-     * nada"): la primera version de esta funcion armaba un numero de
-     * objeto nuevo TAMBIEN para el dict de la anotacion (`annot_num`) y
-     * lo agregaba a /Annots como `pdf_obj_new_ref(annot_num, 0)` -- una
-     * referencia SIMBOLICA por numero. El problema: `annot_num` es
-     * sintetico, recien inventado en ESTA sesion, y NUNCA existio en la
-     * tabla xref del archivo (`xref->count` es el limite real, y
-     * `annot_num` siempre cae por encima) -- asi que apenas se
-     * necesitaba volver a RESOLVER esa referencia (exactamente lo que
-     * hace pdf_render_draw_highlight_annotations en cada render), la
-     * resolucion fallaba en silencio (num >= xref->count) y la
-     * anotacion nunca aparecia, aunque el guardado a archivo si la
-     * hubiera escrito bien (recien ahi 'annot_num' pasa a ser un numero
-     * REAL, con su propia entrada de xref -- por eso el primer test de
-     * esta sesion, que renderizaba DESPUES de guardar y reabrir,
-     * "funcionaba" sin mostrar el bug).
-     *
-     * Fix: NO envolver la anotacion en una referencia -- empujar el
-     * PUNTERO DIRECTO del dict al array /Annots, mismo truco YA usado
-     * para /AP/N (ver pdf_annot_new_highlight: 'ap_stream_obj' se
-     * guarda directo, sin pdf_obj_new_ref, porque pdf_write.c ya sabe
-     * emitir un valor PDF_STREAM como "N G R" automaticamente). Un
-     * PDF_DICT como item de array, en cambio, se serializa INLINE (no
-     * como referencia) -- asi que la anotacion queda embebida dentro de
-     * /Annots tanto en memoria COMO en el archivo guardado; nada
-     * necesita resolverla por numero nunca, ni antes ni despues de
-     * guardar. Solo la apariencia (`ap_obj`, un STREAM -- los streams
-     * SI necesitan su propio numero de objeto, nunca se embeben
-     * inline) sigue necesitando `mark_touched`. */
+    /* La anotacion se agrega a /Annots como PUNTERO DIRECTO, nunca
+     * pdf_obj_new_ref -- una referencia a un numero sintetico de esta
+     * sesion no resolveria hasta guardar+reabrir (bug real, ver
+     * DESIGN.md seccion 78: "resaltar no marca nada"). Un PDF_DICT
+     * como item de array se serializa INLINE, igual que ya hace /AP/N
+     * con el stream de apariencia. Solo la apariencia (un STREAM)
+     * necesita su propio numero de objeto y mark_touched. */
     ap_num = h->next_new_obj_num++;
 
     ap_obj = pdf_annot_generate_highlight_appearance(&h->doc.doc_arena, quads, n_quads,
@@ -2660,12 +2620,9 @@ HB_FUNC(PDF_ANNOTADDSHAPE)
         return;
     }
 
-    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
-     * calculo que PDF_GETPAGESIZEPT/PDF_RENDERTOHBITMAP/
-     * pdf_text_extract_page/Pdf_AnnotAddHighlight (5 copias del mismo
-     * bloque en el motor antes de esta, cada una con este comentario
-     * cruzado -- si se corrige un bug aca corregirlo en las otras 5
-     * tambien). */
+    /* /CropBox intersectado con /MediaBox + /Rotate heredado -- mismo
+     * calculo duplicado en varios sitios de este archivo (ver
+     * PDF_GETPAGESIZEPT). */
     mediabox = pdf_dict_get(page_obj, "MediaBox");
     if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
     {
@@ -2921,12 +2878,9 @@ HB_FUNC(PDF_ANNOTADDTIP)
         return;
     }
 
-    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
-     * calculo que PDF_GETPAGESIZEPT/PDF_RENDERTOHBITMAP/
-     * pdf_text_extract_page/Pdf_AnnotAddHighlight/Pdf_AnnotAddShape (6
-     * copias del mismo bloque en el motor antes de esta, cada una con
-     * este comentario cruzado -- si se corrige un bug aca corregirlo
-     * en las otras 6 tambien). */
+    /* /CropBox intersectado con /MediaBox + /Rotate heredado -- mismo
+     * calculo duplicado en varios sitios de este archivo (ver
+     * PDF_GETPAGESIZEPT). */
     mediabox = pdf_dict_get(page_obj, "MediaBox");
     if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
     {
@@ -3091,10 +3045,9 @@ HB_FUNC(PDF_ANNOTDELETEHIGHLIGHTAT)
         return;
     }
 
-    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
-     * calculo que Pdf_AnnotAddHighlight/PDF_GETPAGESIZEPT/
-     * PDF_RENDERTOHBITMAP/pdf_text_extract_page (ahora 5 copias del
-     * mismo bloque en el motor). */
+    /* /CropBox intersectado con /MediaBox + /Rotate heredado -- mismo
+     * calculo duplicado en varios sitios de este archivo (ver
+     * PDF_GETPAGESIZEPT). */
     mediabox = pdf_dict_get(page_obj, "MediaBox");
     if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
     {
@@ -3263,9 +3216,9 @@ HB_FUNC(PDF_ANNOTGETTIPAT)
     if (page_obj == NULL || page_obj_num <= 0)
         return;
 
-    /* /CropBox intersectado con /MediaBox, /Rotate heredado -- MISMO
-     * calculo que Pdf_AnnotDeleteHighlightAt/Pdf_AnnotAddTip (7ma
-     * copia del mismo bloque en el motor). */
+    /* /CropBox intersectado con /MediaBox + /Rotate heredado -- mismo
+     * calculo duplicado en varios sitios de este archivo (ver
+     * PDF_GETPAGESIZEPT). */
     mediabox = pdf_dict_get(page_obj, "MediaBox");
     if (mediabox != NULL && mediabox->type == PDF_ARRAY && mediabox->u.arr.count == 4)
     {

@@ -5,23 +5,6 @@
 
 #include "pdf_mem.h"
 #include <stdlib.h>
-#include <stdio.h>
-
-/* PDF_ARENA_DEBUG=1 (variable de entorno): traza cada bloque NUEVO
- * pedido (no cada pdf_arena_alloc -- la mayoria se absorben en un
- * bloque ya existente) -- diagnostico TEMPORAL para encontrar un
- * consumo de memoria sin techo aparente (ver DESIGN.md, seccion de
- * rendimiento -- mupdf_bug.cgiid=701945-slow.rendering.pdf consume
- * TODO el presupuesto sin importar cuanto se suba, senial de un loop
- * o de un tamanio de asignacion corrupto/gigante). Mismo criterio que
- * PDF_JPX_DEBUG/PDF_GLYPH_DEBUG ya usados en este proyecto. */
-static long g_pdf_arena_debug_block_count = 0;
-
-/* Diagnostico TEMPORAL: ultimo operador de content stream despachado
- * (pdf_render.c lo actualiza al entrar a pdf_render_op) -- para saber
- * QUE operador esta activo cuando se pide un bloque nuevo de 40 bytes
- * repetido (ver DESIGN.md, investigacion de rendimiento en curso). */
-char g_pdf_debug_last_op[32] = "";
 
 /* Alineacion simple a sizeof(void*). Suficiente para todos los tipos
  * escalares en BCC770 de 32 bits. */
@@ -133,16 +116,6 @@ static pdf_arena_block *pdf_new_block(pdf_arena *arena, size_t min_size)
         alloc_size = min_size; /* objeto mas grande que el bloque tipico */
 
     need = (unsigned long)(sizeof(pdf_arena_block) + alloc_size);
-
-    if (getenv("PDF_ARENA_DEBUG") != NULL)
-    {
-        g_pdf_arena_debug_block_count++;
-        if (g_pdf_arena_debug_block_count <= 40 || (g_pdf_arena_debug_block_count % 5000) == 0 ||
-            min_size > 1024UL*1024UL)
-            fprintf(stderr, "PDF_ARENA_DEBUG: bloque #%ld min_size=%lu alloc_size=%lu used=%lu last_op='%s'\n",
-                    g_pdf_arena_debug_block_count, (unsigned long)min_size, (unsigned long)alloc_size,
-                    arena->ledger ? arena->ledger->used_bytes : 0UL, g_pdf_debug_last_op);
-    }
 
     if (pdf_ledger_reserve(arena->ledger, need) != PDF_OK)
         return NULL; /* presupuesto agotado: el llamador debe degradar */

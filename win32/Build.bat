@@ -42,7 +42,7 @@ REM que tu BCC trata como error, por ejemplo), NO queremos que el link use
 REM silenciosamente un .obj de una vuelta anterior -- mejor que falle clarito
 REM por "no existe" a que enlace con codigo desactualizado sin avisar.
 del /q *.obj 2>nul
-del /q %PRG%.c %PRG%.ppo %PRG%.exe 2>nul
+del /q %PRG%.c %PRG%.ppo %PRG%.exe %PRG%.res 2>nul
 del /q pdf_viewer.c pdf_viewer.ppo 2>nul
 
 ECHO %FWDIR%
@@ -183,6 +183,20 @@ if errorlevel 1 goto COMPILEERRORS
 echo -O2 -e%PRG%.exe -I%hdir%\include -I%bcdir%\include -I%fwh%\include %PRG%.c > b32.bc
 %bcdir%\bin\bcc32 -M -c @b32.bc
 
+REM --- 4b) Recursos (pdf_demo.rc: icono de la app + bitmaps de la toolbar,
+REM     ver harbour\CADBMPS\CADBMPS.RC) -- brcc32 resuelve el #include
+REM     relativo "CadBmps\Cadbmps.rc" (y los BITMAP/ICON sueltos de adentro)
+REM     contra el directorio ACTUAL, por eso corre con cwd=harbour (pushd/
+REM     popd) en vez de sobre una copia en este directorio; -fo%~dp0 fuerza
+REM     el .res resultante de vuelta a este directorio (win32), sin importar
+REM     el cwd temporal. -----------------------------------------------
+ECHO === Compilando recursos (%PRG%.rc) ===
+pushd %ENGABS%\harbour
+%bcdir%\bin\brcc32 -32 -fo%~dp0%PRG%.res %PRG%.rc
+popd
+
+if not exist %PRG%.res goto ENGINEERROR
+
 REM --- 5) Link: objetos del motor + glue + pdf_viewer.obj + %PRG%.obj +
 REM     TODAS las libs de tu build.bat real (sin recortar -- la version
 REM     recortada dio unresolved externals porque FiveH.lib tiene
@@ -279,6 +293,7 @@ echo %bcdir%\lib\psdk\rasapi32.lib + >> b32.bc
 echo %bcdir%\lib\psdk\gdiplus.lib + >> b32.bc
 echo %bcdir%\lib\psdk\shell32.lib + >> b32.bc
 echo %bcdir%\lib\psdk\uxtheme.lib , >> b32.bc
+echo %PRG%.res >> b32.bc
 
 %bcdir%\bin\ilink32 -Gn -aa -Tpe -s @b32.bc
 IF ERRORLEVEL 1 GOTO LINKERROR

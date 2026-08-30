@@ -122,46 +122,6 @@ pdf_obj *pdf_obj_new_name(pdf_arena *arena, const char *name)
     return o;
 }
 
-/* BUG REAL ENCONTRADO Y ARREGLADO -- una miscompilacion de bcc32 7.70
- * (no un error logico nuestro). Con ciertos PDFs reales (reportado
- * contra tests/Los_Kajchas_y_los_proyectos_de_industria.pdf -- texto
- * "ilegible", patron de barras en vez de letras) una referencia
- * indirecta como "/Font 121 0 R" ocasionalmente terminaba con 'num' y
- * 'gen' CAMBIADOS (num=0, gen=121) pese a que los valores que ENTRABAN
- * a esta funcion eran correctos (confirmado con trazas). Se aislo un
- * reproductor minimo (dict anidado armado a mano en un pdf_stream de
- * memoria, con una lectura previa de un token cualquiera antes de
- * parsear el dict -- imita el patron real de un ObjStm: header
- * "objnum offset" x N leido ANTES del objeto en si) que reproducia el
- * problema de forma perfectamente consistente. Se confirmo que es una
- * miscompilacion real (no UB nuestro) porque agregar simples printf()
- * de diagnostico "arreglaba" el sintoma sin cambiar la logica -- firma
- * clasica de un bug de generacion de codigo, no de un puntero colgante.
- *
- * El fix confirmado (verificado 8/8 en el reproductor minimo Y contra
- * el PDF real completo, con pdf_font_load ya resolviendo la fuente
- * correctamente) tiene DOS partes obligatorias juntas: escribir via
- * memcpy() en vez de asignacion directa, Y compilar este archivo junto
- * con pdf_parser.c SIN -O2 (ver win32/Build.bat, CFLAGS_ENG_NOOPT) --
- * ninguna de las dos cosas sola alcanzaba.
- *
- * OJO -- trampa real que costo mucho tiempo detectar: en esta maquina,
- * win32\Build.bat a veces NO recompila pdf_object.c/pdf_parser.c pese a
- * imprimir "Listo" (el mismo problema historico de resolucion de rutas
- * documentado en Build.bat para otros archivos) -- verificar SIEMPRE
- * que el .obj resultante contenga los cambios nuevos (o compilar estos
- * dos archivos a mano con bcc32 directo) antes de descartar un fix como
- * "no funciono".
- *
- * Se agrega ademas una red de seguridad basada en una garantia real del
- * estandar PDF: el objeto numero 0 SIEMPRE es la cabeza de la lista
- * libre (ISO 32000-1 7.5.4) y NUNCA una referencia valida en un PDF
- * bien formado -- si 'num' sale 0 pero 'gen' es distinto de 0, es
- * informacion suficiente para saber que algo se corrompio y vale la
- * pena corregirlo intercambiando num/gen de vuelta -- en el peor caso
- * (un PDF realmente malformado que de verdad tenga gen!=0 en una
- * referencia rota) no se pierde nada, ya era una referencia invalida
- * de cualquier forma. */
 pdf_obj *pdf_obj_new_ref(pdf_arena *arena, long num, long gen)
 {
     pdf_obj *o = pdf_obj_alloc(arena);
@@ -204,29 +164,6 @@ static int pdf_array_capacity_bytes(int capacity, size_t *bytes)
     return PDF_OK;
 }
 
-/* BUG REAL ENCONTRADO (transparencia/shadings, fase 1 -- misma familia
- * que el bug de pdf_obj_new_ref/try_lex_ref ya documentado): bcc32 7.70
- * miscompila la secuencia de asignaciones directas consecutivas a los
- * campos int adyacentes de un miembro de union struct (aqui
- * 'u.arr.count'/'u.arr.capacity', antes 'u.ref.num'/'u.ref.gen') --
- * confirmado con un reproductor minimo aislado (arena+pdf_object solos,
- * sin parser): tras pdf_obj_new_array(arena,4) el objeto quedaba con
- * count=4 (deberia ser 0) y capacity=0 (deberia ser 4) -- los DOS
- * valores literalmente intercambiados -- y en pdf_array_push() el
- * puntero 'items' escrito quedaba como un contador (1,2,3,4...) en vez
- * de una direccion real. IMPORTANTE: a diferencia del bug de
- * pdf_obj_new_ref, este reproduce aunque el archivo YA se compila sin
- * -O2 (CFLAGS_ENG_NOOPT en Build.bat) -- confirma que para este patron
- * de codigo la miscompilacion no depende del nivel de optimizacion, asi
- * que la unica mitigacion confiable es evitar la asignacion directa a
- * los campos: cada escritura a un campo de 'u.arr' pasa por memcpy()
- * desde una variable local, igual criterio que pdf_obj_new_ref. Como
- * TODO objeto PDF_ARRAY pasa por estas dos funciones (MediaBox, Kids,
- * Contents, Widths, y -- relevante para Functions/Shadings -- /Domain,
- * /Range, /C0, /C1, /Coords), este bug podia corromper silenciosamente
- * cualquier array real sin que el sintoma fuera obvio (un MediaBox mal
- * leido cae al default carta 612x792, que "parece" razonable para
- * muchos PDFs reales -- por eso paso desapercibido hasta ahora). */
 pdf_obj *pdf_obj_new_array(pdf_arena *arena, int capacity_hint)
 {
     pdf_obj *o;
@@ -349,16 +286,6 @@ pdf_obj *pdf_obj_new_dict(pdf_arena *arena)
     return o;
 }
 
-/* BUG REAL ENCONTRADO (transparencia/shadings, fase 1 -- misma familia
- * que pdf_obj_new_ref/pdf_obj_new_array, ver comentarios ahi): esta
- * funcion escribe CINCO campos consecutivos del miembro de union
- * 'u.stm' via asignacion directa -- confirmado que dispara la misma
- * miscompilacion de bcc32 7.70 (reproducido end-to-end: al leer un
- * cross-reference STREAM real de tests/Conveyor_Handbook.pdf, el
- * objeto stream resultante quedaba con 'raw_offset'/'raw_length'
- * corrompidos, causando un crash mas adelante en
- * pdf_decode_stream_generic). Mismo fix: cada campo se escribe via
- * memcpy() desde una variable local en vez de asignacion directa. */
 pdf_obj *pdf_obj_new_stream(pdf_arena *arena, pdf_obj *dict_obj,
                              long raw_offset, long raw_length,
                              long obj_num, long obj_gen)
@@ -384,9 +311,6 @@ pdf_obj *pdf_obj_new_stream(pdf_arena *arena, pdf_obj *dict_obj,
     return o;
 }
 
-/* Ver pdf_obj_new_stream arriba -- mismo patron de escritura via
- * memcpy() (misma familia de bug de bcc32 7.70 documentada ahi y en
- * pdf_obj_new_ref/pdf_obj_new_array). */
 pdf_obj *pdf_obj_new_synthetic_stream(pdf_arena *arena, pdf_obj *dict_obj,
                                        const unsigned char *data, long len,
                                        long obj_num, long obj_gen)
@@ -447,34 +371,6 @@ int pdf_dict_set(pdf_arena *arena, pdf_obj *obj, const char *key, pdf_obj *val)
     if (slot == NULL)
         return PDF_ERR_BADARG;
 
-    /* BUG REAL ENCONTRADO (limpieza de anotaciones de prueba, ver
-     * DESIGN.md): esta funcion SIEMPRE agregaba una entrada NUEVA al
-     * frente de la lista, sin buscar si 'key' ya existia -- llamarla
-     * dos veces con la MISMA clave (p.ej. pisar un /Annots que ya
-     * tenia contenido, en vez de crearlo desde /Annots ausente) dejaba
-     * DOS entradas con el mismo nombre en el dict. pdf_dict_get()
-     * (mas abajo) siempre devuelve la PRIMERA que encuentra recorriendo
-     * la lista, y como la entrada nueva queda al FRENTE, LEER el dict
-     * desde este mismo motor "andaba bien" -- pero write_dict_entries()
-     * (pdf_write.c) escribe TODAS las entradas sin filtrar duplicados,
-     * asi que el archivo guardado terminaba con la clave repetida DOS
-     * VECES en la sintaxis real. La norma dice que ante una clave
-     * duplicada "la ultima ocurrencia gana" -- como la entrada VIEJA
-     * queda ULTIMA en la lista (la nueva se prepende adelante), un
-     * lector conforme (confirmado con pikepdf/qpdf, que directamente
-     * avisa "dictionary has duplicated key") terminaba usando el valor
-     * VIEJO, ignorando por completo la actualizacion. Nunca se habia
-     * disparado antes porque todo el codigo de este proyecto que llama
-     * pdf_dict_set() sobre "Annots"/"V"/etc lo hacia SOLO cuando la
-     * clave todavia no existia (el caso "falta" de las 3 resoluciones
-     * de /Annots, ver Pdf_AnnotAddHighlight) -- limpiar TODAS las
-     * anotaciones de una pagina que YA tenia /Annots fue el primer
-     * caso real que reescribe una clave EXISTENTE.
-     *
-     * Fix: buscar la entrada existente primero -- si esta, actualizar
-     * su 'val' IN PLACE (misma entrada, mismo lugar en la lista, cero
-     * duplicados posibles); si no esta, agregar una nueva al frente
-     * como antes. */
     for (e = *slot; e != NULL; e = e->next)
     {
         if (strcmp(e->key, key) == 0)
@@ -498,11 +394,6 @@ int pdf_dict_set(pdf_arena *arena, pdf_obj *obj, const char *key, pdf_obj *val)
 
     memcpy(keycopy, key, len + 1);
 
-    /* Misma familia de bugs documentados en pdf_obj_new_ref/
-     * pdf_obj_new_array/pdf_xref.c/pdf_stream.c: tres escrituras
-     * directas consecutivas a campos adyacentes de un struct recien
-     * alocado ('e->key'/'e->val'/'e->next') -- fix preventivo via
-     * memcpy(), mismo estilo que el resto del motor. */
     {
         pdf_dict_entry *next_val = *slot;
         memcpy(&e->key, &keycopy, sizeof(keycopy));

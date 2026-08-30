@@ -10,18 +10,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include <stdio.h>
-
-/* PDF_CONTENT_DEBUG=1: diagnostico TEMPORAL para el mismo consumo de
- * memoria sin techo de mupdf_bug.cgiid=701945-slow.rendering.pdf que
- * PDF_ARENA_DEBUG (pdf_mem.c) ya viene rastreando -- el content stream
- * de la PAGINA es de solo 470 bytes, asi que el loop tiene que estar
- * en un content stream ANIDADO (Form XObject o Pattern). Traza lx.pos
- * vs lx.len para distinguir "loop realmente trabado" (pos no avanza)
- * de "stream anidado genuinamente gigante" (pos avanza sin parar). */
-static long g_pdf_content_debug_tok_count = 0;
-static long g_pdf_content_debug_type_count[10];
-static long g_pdf_content_debug_nested_num_count = 0;
 
 typedef struct
 {
@@ -278,10 +266,8 @@ static pdf_obj *content_parse_value(pdf_clex *lx, pdf_ctoken *t, pdf_arena *aren
     switch (t->type)
     {
     case CTOK_INT:
-        if (getenv("PDF_CONTENT_DEBUG") != NULL) g_pdf_content_debug_nested_num_count++;
         return pdf_obj_new_int(arena, t->ival);
     case CTOK_REAL:
-        if (getenv("PDF_CONTENT_DEBUG") != NULL) g_pdf_content_debug_nested_num_count++;
         return pdf_obj_new_real(arena, t->dval);
     case CTOK_STRING: return pdf_obj_new_string(arena, t->text, t->text_len);
     case CTOK_NAME:   return pdf_obj_new_name(arena, t->text);
@@ -461,28 +447,7 @@ int pdf_content_run_device(const unsigned char *data, long len,
     {
         clex_next(&lx, &tok);
         if (tok.type == CTOK_EOF)
-        {
-            if (getenv("PDF_CONTENT_DEBUG") != NULL)
-                fprintf(stderr, "PDF_CONTENT_DEBUG: EOF len=%ld -- tipos: EOF=%ld INT=%ld REAL=%ld STRING=%ld NAME=%ld ARR_OPEN=%ld ARR_CLOSE=%ld DICT_OPEN=%ld DICT_CLOSE=%ld KEYWORD=%ld nested_nums(arena, NO pool)=%ld\n",
-                        len, g_pdf_content_debug_type_count[0], g_pdf_content_debug_type_count[1],
-                        g_pdf_content_debug_type_count[2], g_pdf_content_debug_type_count[3],
-                        g_pdf_content_debug_type_count[4], g_pdf_content_debug_type_count[5],
-                        g_pdf_content_debug_type_count[6], g_pdf_content_debug_type_count[7],
-                        g_pdf_content_debug_type_count[8], g_pdf_content_debug_type_count[9],
-                        g_pdf_content_debug_nested_num_count);
             break;
-        }
-
-        if (getenv("PDF_CONTENT_DEBUG") != NULL)
-        {
-            g_pdf_content_debug_tok_count++;
-            if (tok.type >= 0 && tok.type < 10)
-                g_pdf_content_debug_type_count[tok.type]++;
-            if (g_pdf_content_debug_tok_count <= 20 ||
-                (g_pdf_content_debug_tok_count % 200000) == 0)
-                fprintf(stderr, "PDF_CONTENT_DEBUG: tok #%ld type=%d text='%s' pos=%ld/%ld\n",
-                        g_pdf_content_debug_tok_count, (int)tok.type, tok.text, lx.pos, lx.len);
-        }
 
         if (tok.type == CTOK_KEYWORD)
         {

@@ -126,6 +126,25 @@ void pdf_bitmap_set_pixel(pdf_bitmap *bmp, int x, int y, pdf_color c);
 void pdf_bitmap_set_pixel_coverage(pdf_bitmap *bmp, int x, int y,
                                    pdf_color c, double coverage);
 
+/* BUG REAL DE RENDIMIENTO (Arturo: "comparando con Acrobat/MuPDF el
+ * nuestro es extremadamente lento", 3240-3241-2.pdf): pdf_image_draw
+ * dibuja imagenes ya decodificadas como bytes RGB de 0-255, pero
+ * pdf_bitmap_set_pixel() solo acepta un pdf_color de doubles en
+ * [0,1] -- forzaba a CADA pixel de imagen (hasta 2.5 millones por
+ * "Do") a hacer 3 divisiones por 255.0 para entrar, que
+ * pdf_bitmap_set_pixel_coverage() luego multiplicaba por 255.0 de
+ * nuevo para volver a bytes (clamp_u8), un ida-y-vuelta sin sentido
+ * para datos que ya eran bytes. Esta variante hace exactamente el
+ * mismo camino/chequeos que pdf_bitmap_set_pixel_coverage (bounds,
+ * clip, opacity, clip_mask, soft_mask) pero opera en bytes: si el
+ * resultado da opaco/Normal/sin-knockout (el caso comun, sin
+ * mascaras activas) escribe los bytes tal cual sin ninguna
+ * conversion; si no, cae al camino general convirtiendo a
+ * pdf_color recien ahi (caso raro: imagen con soft mask o dentro de
+ * un grupo con blend mode no-Normal). */
+void pdf_bitmap_set_pixel_rgb_u8(pdf_bitmap *bmp, int x, int y,
+                                 unsigned char r, unsigned char g, unsigned char b);
+
 /* Rellena el rectangulo [x0,y0]-[x1,y1] (en coordenadas de pixel, ya
  * convertidas desde espacio PDF por el llamador) con el color dado.
  * Recorta contra los bordes del bitmap. */

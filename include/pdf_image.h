@@ -66,9 +66,23 @@ typedef struct pdf_image_s
  * /Width /Height /BitsPerComponent /ColorSpace /Filter, y el stream
  * crudo accesible via 'raw_offset'/'raw_length' que trae el propio
  * img_dict si es PDF_STREAM). Escribe el resultado en 'arena'
- * (tipicamente page->decode_arena). Devuelve PDF_OK o error. */
+ * (tipicamente page->decode_arena). Devuelve PDF_OK o error.
+ *
+ * 'dest_w_px'/'dest_h_px' (ver DESIGN.md seccion 87): tamanio ESTIMADO
+ * en pixeles al que esta imagen se va a dibujar (bounding box del
+ * cuadrado unitario de espacio de imagen transformado por el CTM
+ * vigente -- ver pdf_render.c, calculado ANTES de llamar aca). Se usa
+ * SOLO para decidir si conviene pedirle a DCTDecode una resolucion
+ * reducida (ver 'reduction' en pdf_filter_dct) cuando la imagen se va
+ * a mostrar bastante mas chica que su tamanio nativo -- no afecta
+ * ningun otro filtro. Pasar 0.0/0.0 quiere decir "tamanio de destino
+ * desconocido" y decodifica siempre a resolucion nativa completa (el
+ * comportamiento de siempre) -- es lo que hace la llamada recursiva
+ * para /SMask mas abajo en este mismo archivo, ya que una mascara
+ * puede tener una resolucion nativa bien distinta de la imagen base y
+ * de todos modos se remuestrea aparte (ver pdf_image_load_smask). */
 int pdf_image_decode(pdf_stream *st, const pdf_xref_table *xref, pdf_obj *img_dict, pdf_arena *arena,
-                      pdf_image *out);
+                      pdf_image *out, double dest_w_px, double dest_h_px);
 
 /* Compone 'img' sobre 'bmp', mapeando el cuadrado unitario [0,1]x[0,1]
  * de espacio de imagen a traves de 'unit_to_pixel' (la matriz completa

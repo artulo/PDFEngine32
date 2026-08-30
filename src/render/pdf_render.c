@@ -8,8 +8,6 @@
 #include "pdf_form.h"
 #include <string.h>
 #include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 void pdf_render_device_init(pdf_render_device *dev, pdf_bitmap *bitmap,
                              double page_height_pt, double scale,
@@ -497,8 +495,6 @@ static void fill_current_path(pdf_render_device *dev, pdf_gstate *gs, pdf_fill_r
  * alfa del grupo en vez de luminosidad) queda fuera de alcance -- se
  * ignora esa clave de /SMask, mismo criterio tolerante que el resto del
  * motor (degradar a "sin soft mask" en vez de un valor inventado). */
-static long g_pdf_smask_debug_count = 0;
-
 static void load_soft_mask_group(pdf_render_device *dev, pdf_gstate *gs, pdf_obj *smask_dict)
 {
     const char *stype;
@@ -506,14 +502,6 @@ static void load_soft_mask_group(pdf_render_device *dev, pdf_gstate *gs, pdf_obj
     pdf_bitmap mask_bmp;
     unsigned char *lum;
     long i, n;
-
-    if (getenv("PDF_ARENA_DEBUG") != NULL)
-    {
-        g_pdf_smask_debug_count++;
-        if (g_pdf_smask_debug_count <= 20 || (g_pdf_smask_debug_count % 1000) == 0)
-            fprintf(stderr, "PDF_SMASK_DEBUG: llamada #%ld a load_soft_mask_group, form_depth=%d\n",
-                    g_pdf_smask_debug_count, dev->form_depth);
-    }
 
     gs->smask_mask = NULL;
     gs->smask_stride = 0;
@@ -663,9 +651,7 @@ static pdf_obj *find_font_dict(pdf_render_device *dev, const char *name)
      * sustitucion de sistema sin is_bold/is_serif reales). Invisible
      * con la caja placeholder de antes (no dependia de la fuente para
      * verse "razonable"), pero con contornos reales el ancho/estilo
-     * equivocado se nota -- ver PDF_GLYPH_DEBUG mas abajo, agregado
-     * durante la investigacion de este bug (mismo criterio que
-     * PDF_JPX_DEBUG en pdf_jpx.c). */
+     * equivocado se nota. */
     if (font_res->type == PDF_REF)
         font_res = pdf_parser_load_object(dev->st, dev->xref, font_res->u.ref.num, dev->arena);
     if (font_res == NULL || font_res->type != PDF_DICT)
@@ -681,16 +667,11 @@ static pdf_obj *find_font_dict(pdf_render_device *dev, const char *name)
     return ref; /* dict de fuente inline (raro, pero valido) */
 }
 
-/* PDF_GLYPH_DEBUG=1 (variable de entorno): imprime a stderr, por cada
- * 'Tf', si la fuente se pudo resolver -- diagnostico agregado durante
- * la investigacion del bug de /Font indirecto de arriba, mismo
- * criterio que PDF_JPX_DEBUG en pdf_jpx.c. */
 static pdf_font *resolve_font(pdf_render_device *dev, const char *name)
 {
     int i;
     pdf_obj *fdict;
     pdf_font *font;
-    int debug = (getenv("PDF_GLYPH_DEBUG") != NULL);
 
     for (i = 0; i < dev->n_fonts; i++)
         if (strcmp(dev->font_cache[i].name, name) == 0)
@@ -701,10 +682,7 @@ static pdf_font *resolve_font(pdf_render_device *dev, const char *name)
 
     fdict = find_font_dict(dev, name);
     if (fdict == NULL)
-    {
-        if (debug) fprintf(stderr, "PDF_GLYPH_DEBUG: Tf /%s -- find_font_dict no encontro el recurso\n", name);
         return NULL;
-    }
 
     /* Cache de documento (ver pdf_font_cache_fn, pdf_render.h) -- si
      * esta activo, 'fdict' (puntero ESTABLE gracias al cache de
@@ -716,9 +694,6 @@ static pdf_font *resolve_font(pdf_render_device *dev, const char *name)
     if (dev->font_cache_hook != NULL)
     {
         font = dev->font_cache_hook(dev->font_cache_hook_user, fdict, dev->st, dev->xref, dev->arena);
-        if (debug)
-            fprintf(stderr, "PDF_GLYPH_DEBUG: Tf /%s -- font_cache_hook %s base_font=%s\n",
-                    name, (font != NULL) ? "hit/load OK" : "fallo", (font != NULL) ? font->base_font : "?");
     }
     else
     {
@@ -726,9 +701,6 @@ static pdf_font *resolve_font(pdf_render_device *dev, const char *name)
         if (font != NULL)
         {
             int rc = pdf_font_load(fdict, font, dev->st, dev->xref, dev->arena);
-            if (debug)
-                fprintf(stderr, "PDF_GLYPH_DEBUG: Tf /%s -- pdf_font_load rc=%d base_font=%s\n",
-                        name, rc, (rc == PDF_OK) ? font->base_font : "?");
             if (rc != PDF_OK)
                 font = NULL;
         }
@@ -1056,7 +1028,17 @@ static void show_text_bytes(pdf_render_device *dev, pdf_gstate *gs,
 
                     pdf_path_reset(&glyph_path);
                     ctx.dev = dev; ctx.trm = trm; ctx.path = &glyph_path; ctx.xscale = xscale;
-                    pdf_ttf_glyph_outline(gfont, gid, glyph_moveto, glyph_lineto, &ctx, 0);
+                    /* BUG REAL DE RENDIMIENTO (Arturo: "esta lento cuando
+                     * se abre el archivo" -- ver DESIGN.md seccion 89):
+                     * 'pixel_height' (ya calculado arriba, distancia en
+                     * pixeles que ocupa UN em de esta ocurrencia
+                     * puntual del glyph) es exactamente lo que
+                     * pdf_ttf_glyph_outline necesita para no
+                     * sobre-subdividir curvas de texto de cuerpo normal
+                     * (5-10px de alto) mientras sigue subdividiendo fino
+                     * para texto grande/zoom alto -- ver
+                     * quad_segment_count en pdf_ttf.c. */
+                    pdf_ttf_glyph_outline(gfont, gid, glyph_moveto, glyph_lineto, &ctx, 0, pixel_height);
                     if (glyph_path.n_subpaths > 0)
                     {
                         sync_paint_state(dev, gs, 0);
@@ -1288,6 +1270,8 @@ static void draw_form_xobject(pdf_render_device *dev, pdf_obj *xobj)
                 int using_group = 0;
                 double group_alpha = gs->fill_alpha;
                 int group_blend = gs->blend_mode;
+                unsigned char *group_smask = gs->smask_mask;
+                int group_smask_stride = gs->smask_stride;
 
                 dev->base_ctm = gs->ctm; /* espacio de patrones DENTRO de este form -- ver campo en pdf_render.h */
 
@@ -1295,7 +1279,7 @@ static void draw_form_xobject(pdf_render_device *dev, pdf_obj *xobj)
                  * /Transparency >>, ver DESIGN.md seccion 68):
                  * el contenido del form se renderiza en un
                  * bitmap RGBA temporal APARTE (aislado) y se
-                 * compone de vuelta con ca/BM del gstate
+                 * compone de vuelta con ca/BM/SMask del gstate
                  * vigente en ESTE 'Do' -- asi un rectangulo
                  * semitransparente que se solapa a si mismo
                  * DENTRO del grupo se ve como un solo blend,
@@ -1308,7 +1292,23 @@ static void draw_form_xobject(pdf_render_device *dev, pdf_obj *xobj)
                  * profunda de grupos anidados podria agotar
                  * el presupuesto -- mas alla de la cota se
                  * corre el form directo sin aislar (degrada,
-                 * no crashea). */
+                 * no crashea).
+                 *
+                 * BUG REAL ENCONTRADO (Arturo: "fondos fantasmas" en
+                 * VWAM201103.pdf) -- 'group_smask'/'group_smask_stride'
+                 * se capturan ACA, antes de correr el contenido anidado
+                 * (que puede pisar gs->smask_mask con sus propios 'gs'),
+                 * y se aplican a mano sobre 'saved_bitmap' justo antes
+                 * de compositar mas abajo. Sin esto, un ExtGState con
+                 * /SMask de luminosidad puesto ANTES de 'Do' sobre un
+                 * form con grupo de transparencia se ignoraba por
+                 * completo al recomponer el grupo -- el unico otro
+                 * lugar que sincroniza el soft mask del bitmap
+                 * (sync_paint_state) nunca se llama para 'Do' con
+                 * grupo, a diferencia de fills/strokes/imagenes. El
+                 * grupo entero quedaba visible sin la mascara que
+                 * debia recortarlo a la forma real (el texto del
+                 * encabezado, en este caso). */
                 if (dev->form_depth < 4)
                 {
                     pdf_obj *group = pdf_dict_get(xobj, "Group");
@@ -1332,13 +1332,6 @@ static void draw_form_xobject(pdf_render_device *dev, pdf_obj *xobj)
                     }
                 }
 
-                if (getenv("PDF_CONTENT_DEBUG") != NULL)
-                {
-                    static long g_pdf_form_debug_count = 0;
-                    g_pdf_form_debug_count++;
-                    fprintf(stderr, "PDF_FORM_DEBUG: invocacion #%ld draw_form_xobject xobj=%p len=%ld form_depth=%d\n",
-                            g_pdf_form_debug_count, (void*)xobj, raw_content.len, dev->form_depth);
-                }
                 dev->form_depth++;
                 {
                     pdf_content_ops nested_ops;
@@ -1352,6 +1345,7 @@ static void draw_form_xobject(pdf_render_device *dev, pdf_obj *xobj)
                 if (using_group)
                 {
                     dev->bitmap = saved_bitmap;
+                    pdf_bitmap_set_soft_mask(saved_bitmap, group_smask, group_smask_stride);
                     pdf_bitmap_composite(saved_bitmap, &group_bmp, group_alpha, group_blend);
                 }
 
@@ -1377,18 +1371,10 @@ static void draw_form_xobject(pdf_render_device *dev, pdf_obj *xobj)
     }
 }
 
-extern char g_pdf_debug_last_op[32];
-
 void pdf_render_op(void *user, const char *opname, pdf_obj **args, int nargs)
 {
     pdf_render_device *dev = (pdf_render_device *)user;
     pdf_gstate *gs = cur_gstate(dev);
-
-    if (getenv("PDF_ARENA_DEBUG") != NULL)
-    {
-        strncpy(g_pdf_debug_last_op, opname, sizeof(g_pdf_debug_last_op) - 1);
-        g_pdf_debug_last_op[sizeof(g_pdf_debug_last_op) - 1] = 0;
-    }
 
     /* --- pila de estado grafico ------------------------------------- */
 
@@ -2154,19 +2140,63 @@ void pdf_render_op(void *user, const char *opname, pdf_obj **args, int nargs)
                 if (subtype != NULL && strcmp(subtype, "Image") == 0)
                 {
                     pdf_image img;
-                    if (pdf_image_decode(dev->st, dev->xref, xobj, dev->arena, &img) == PDF_OK)
+                    /* el cuadrado unitario [0,1]x[0,1] de espacio de
+                     * imagen se mapea a traves del CTM vigente, igual
+                     * que cualquier otro path -- despues se convierte
+                     * a espacio de pixel para la composicion. Se calcula
+                     * ACA (antes de decodificar, no despues como antes)
+                     * para poder estimar el tamanio de destino en pixeles
+                     * y pasarselo a pdf_image_decode -- ver comentario
+                     * grande de 'dest_w_px'/'dest_h_px' mas abajo y
+                     * DESIGN.md seccion 87. */
+                    pdf_matrix unit_to_pixel_pdf = gs->ctm;
+                    pdf_matrix to_pixel_mat;
+                    pdf_matrix unit_to_pixel;
+                    double dest_w_px, dest_h_px;
+
+                    to_pixel_mat = rotation_to_pixel_matrix( dev );
+                    unit_to_pixel = mat_concat(unit_to_pixel_pdf, to_pixel_mat);
+
+                    /* BUG REAL DE RENDIMIENTO (Arturo: "esta como antes,
+                     * mejoro muy poco" -- continuacion secciones 86/87):
+                     * hasta esta ronda, DCTDecode siempre decodificaba a
+                     * resolucion NATIVA completa sin importar a que
+                     * tamanio se iba a mostrar despues -- pdf_image_draw
+                     * recien resampleaba DESPUES de terminado el decode
+                     * completo. Midiendo con un harness temporal se
+                     * confirmo que la IDCT es ~71% del tiempo de decode
+                     * de una imagen tipica de esta clase de PDF, y ese
+                     * costo NO bajaba con la escala de pantalla. Estimar
+                     * ACA (con el mismo calculo de bounding-box que usa
+                     * pdf_image_draw sobre las 4 esquinas del cuadrado
+                     * unitario) el tamanio de destino en pixeles ANTES de
+                     * decodificar permite pedirle a pdf_image_decode que
+                     * decodifique directo a una resolucion mas chica
+                     * cuando corresponda (ver 'reduction' en
+                     * pdf_filter_dct/pdf_filter.h). */
                     {
-                        /* el cuadrado unitario [0,1]x[0,1] de espacio de
-                         * imagen se mapea a traves del CTM vigente, igual
-                         * que cualquier otro path -- despues se convierte
-                         * a espacio de pixel para la composicion. */
-                        pdf_matrix unit_to_pixel_pdf = gs->ctm;
-                        pdf_matrix to_pixel_mat;
-                        pdf_matrix unit_to_pixel;
+                        pdf_point corners[4];
+                        double minx, maxx, miny, maxy;
+                        int ci;
+                        corners[0] = mat_transform(unit_to_pixel, 0.0, 0.0);
+                        corners[1] = mat_transform(unit_to_pixel, 1.0, 0.0);
+                        corners[2] = mat_transform(unit_to_pixel, 1.0, 1.0);
+                        corners[3] = mat_transform(unit_to_pixel, 0.0, 1.0);
+                        minx = maxx = corners[0].x;
+                        miny = maxy = corners[0].y;
+                        for (ci = 1; ci < 4; ci++)
+                        {
+                            if (corners[ci].x < minx) minx = corners[ci].x;
+                            if (corners[ci].x > maxx) maxx = corners[ci].x;
+                            if (corners[ci].y < miny) miny = corners[ci].y;
+                            if (corners[ci].y > maxy) maxy = corners[ci].y;
+                        }
+                        dest_w_px = maxx - minx;
+                        dest_h_px = maxy - miny;
+                    }
 
-                        to_pixel_mat = rotation_to_pixel_matrix( dev );
-
-                        unit_to_pixel = mat_concat(unit_to_pixel_pdf, to_pixel_mat);
+                    if (pdf_image_decode(dev->st, dev->xref, xobj, dev->arena, &img, dest_w_px, dest_h_px) == PDF_OK)
+                    {
                         /* Etapa 10 (ver DESIGN.md seccion 68): las
                          * imagenes ahora pasan por el mismo compositor
                          * real que fills/stroke/texto -- sync_paint_state

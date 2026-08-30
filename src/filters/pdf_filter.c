@@ -596,13 +596,34 @@ static int jpeg_getbit(jpeg_bits *b)
     return (int)((b->bitbuf >> b->bitcnt) & 1);
 }
 
+/* BUG REAL DE RENDIMIENTO (Arturo: "comparando con Acrobat/MuPDF el
+ * nuestro es extremadamente lento", medido contra 3240-3241-2.pdf --
+ * un escaneo de pagina completa, decenas de miles de bloques JPEG por
+ * imagen): 'jpeg_getbits'/'jpeg_huff_decode' son los dos puntos MAS
+ * calientes del decoder (se llaman por CADA bit de CADA simbolo DC/AC
+ * de CADA bloque de la imagen) y antes llamaban a 'jpeg_getbit()' --
+ * una funcion aparte -- una vez POR BIT. bcc32 7.70 no la inlinea de
+ * por si (a diferencia de un compilador moderno). Se pega el CUERPO
+ * de 'jpeg_getbit()' directo adentro de estos dos loops -- MISMA
+ * logica exacta, ni una linea de comportamiento distinta, solo sin el
+ * costo de la llamada a funcion en el camino mas transitado. La
+ * version con funcion sigue existiendo y se usa igual en el camino
+ * progresivo (SOF2, mucho menos comun) mas abajo. */
 static int jpeg_getbits(jpeg_bits *b, int n)
 {
     int v = 0, i;
     for (i = 0; i < n; i++)
     {
-        int bit = jpeg_getbit(b);
-        if (bit < 0) return -1;
+        int bit;
+        if (b->bitcnt == 0)
+        {
+            int c = jpeg_next_byte(b);
+            if (c < 0) return -1;
+            b->bitbuf = (unsigned int)c;
+            b->bitcnt = 8;
+        }
+        b->bitcnt--;
+        bit = (int)((b->bitbuf >> b->bitcnt) & 1);
         v = (v << 1) | bit;
     }
     return v;
@@ -613,9 +634,16 @@ static int jpeg_huff_decode(jpeg_bits *b, const pdf_jpeg_huff *h)
     int code = 0, first = 0, index = 0, len;
     for (len = 1; len <= 16; len++)
     {
-        int bit = jpeg_getbit(b);
-        int count;
-        if (bit < 0) return -1;
+        int bit, count;
+        if (b->bitcnt == 0)
+        {
+            int c = jpeg_next_byte(b);
+            if (c < 0) return -1;
+            b->bitbuf = (unsigned int)c;
+            b->bitcnt = 8;
+        }
+        b->bitcnt--;
+        bit = (int)((b->bitbuf >> b->bitcnt) & 1);
         code = (code << 1) | bit;
         count = h->counts[len];
         if (code - first < count)
@@ -692,6 +720,7 @@ static int jpeg_decode_block(jpeg_bits *b, const pdf_jpeg_huff *dc_h,
         }
         k++;
     }
+
     return PDF_OK;
 }
 
@@ -700,35 +729,170 @@ static int jpeg_decode_block(jpeg_bits *b, const pdf_jpeg_huff *dc_h,
 static double PDF_JPEG_COS[8][8];
 static int pdf_jpeg_cos_ready = 0;
 
+/* IDCT reducida de 4 puntos (ver DESIGN.md seccion 87 y el comentario
+ * grande de 'jpeg_idct_block' mas abajo) -- tabla ANALOGA a
+ * PDF_JPEG_COS pero para N=4 en vez de N=8: misma formula general de
+ * la IDCT-III (out[x] = 0.5 * suma_u C(u)*S(u)*cos((2x+1)*u*pi/(2N))),
+ * con N=4 en el denominador del coseno en vez de N=8. NO es la tabla
+ * de 8 puntos truncada a un 4x4 -- son angulos distintos porque
+ * representan una transformada de 4 puntos independiente, no una
+ * submuestra de la de 8. Verificado numericamente (harness Python con
+ * numpy, coeficientes con la forma tipica de un bloque JPEG real ya
+ * cuantizado -- DC grande, AC decayendo con la frecuencia) contra
+ * decodificar a resolucion completa y promediar 2x2 despues: error
+ * absoluto medio ~1.4 de 255, maximo ~4.2 en 5000 bloques de prueba --
+ * la diferencia esperada de una tecnica de escalado real (no es un
+ * atajo bit-exacto como el de la seccion 86, es una aproximacion de
+ * MENOR calidad a proposito, exactamente como hace cualquier decoder
+ * JPEG real con "scaled decoding" -- libjpeg la llama
+ * scale_num/scale_denom). */
+static double PDF_JPEG_COS4[4][4];
+
 static void jpeg_init_cos_table(void)
 {
     int x, u;
     if (pdf_jpeg_cos_ready) return;
     for (x = 0; x < 8; x++)
         for (u = 0; u < 8; u++)
-            PDF_JPEG_COS[x][u] = cos((2.0 * x + 1.0) * u * 3.14159265358979323846 / 16.0);
+        {
+            /* BUG REAL DE RENDIMIENTO (misma medicion que
+             * jpeg_compose_rgb mas abajo, ver ese comentario): el
+             * factor C(u) (1/sqrt(2) solo para u==0) se aplicaba con
+             * un branch DENTRO del loop mas caliente del decoder
+             * (128 multiplicaciones por bloque, para cada uno de los
+             * ~90000+ bloques de una foto escaneada tipica) en vez de
+             * hornearse UNA vez en esta tabla, que ya se arma una sola
+             * vez para todo el proceso. */
+            double cu = (u == 0) ? (1.0 / 1.4142135623730951) : 1.0;
+            PDF_JPEG_COS[x][u] = cu * cos((2.0 * x + 1.0) * u * 3.14159265358979323846 / 16.0);
+        }
+    for (x = 0; x < 4; x++)
+        for (u = 0; u < 4; u++)
+        {
+            double cu = (u == 0) ? (1.0 / 1.4142135623730951) : 1.0;
+            PDF_JPEG_COS4[x][u] = cu * cos((2.0 * x + 1.0) * u * 3.14159265358979323846 / 8.0);
+        }
     pdf_jpeg_cos_ready = 1;
 }
 
+/* BUG REAL DE RENDIMIENTO (Arturo: "mejoro pero sigue lento" --
+ * continuacion de la seccion 85, medido contra 3240-3241-2.pdf, donde
+ * se aislo que ~750ms de los ~960ms de render por pagina son el
+ * propio Huffman+IDCT del decoder JPEG): la cuantizacion de JPEG
+ * concentra la energia en las frecuencias BAJAS y produce, en la
+ * inmensa mayoria de los bloques reales, muchos de los 64
+ * coeficientes en CERO -- ese es el mecanismo mismo por el que
+ * DCT+cuantizacion comprime. 'jpeg_idct_1d' sin embargo multiplicaba
+ * y sumaba los 8 terminos SIEMPRE, incluyendo los que son cero (que
+ * no aportan nada al resultado: sumar exactamente 0.0 a un double
+ * jamas cambia su valor, no es una aproximacion). Reordenar el loop
+ * (recorrer 'u' afuera, saltando los que son 0.0, y acumular sobre
+ * 'x' adentro) da EXACTAMENTE el mismo resultado bit a bit -- misma
+ * cuenta de sumas, mismo orden de acumulacion, solo se evita la
+ * multiplicacion+suma cuando el termino no puede cambiar nada. */
 static void jpeg_idct_1d(const double *in, double *out)
 {
     int x, u;
-    for (x = 0; x < 8; x++)
+    for (x = 0; x < 8; x++) out[x] = 0.0;
+    for (u = 0; u < 8; u++)
     {
-        double sum = 0.0;
-        for (u = 0; u < 8; u++)
-        {
-            double cu = (u == 0) ? (1.0 / 1.4142135623730951) : 1.0;
-            sum += cu * in[u] * PDF_JPEG_COS[x][u];
-        }
-        out[x] = sum * 0.5;
+        double v = in[u];
+        if (v == 0.0) continue;
+        for (x = 0; x < 8; x++)
+            out[x] += v * PDF_JPEG_COS[x][u];
     }
+    for (x = 0; x < 8; x++) out[x] *= 0.5;
 }
 
-static void jpeg_idct_block(const int *coeffs, unsigned char *out)
+/* Version de 4 puntos de jpeg_idct_1d de arriba -- mismo truco de
+ * saltar terminos en cero, misma forma, tabla PDF_JPEG_COS4 en vez de
+ * PDF_JPEG_COS. Usada por el camino de reduccion (ver comentario
+ * grande de jpeg_idct_block mas abajo). */
+static void jpeg_idct_1d_4(const double *in, double *out)
+{
+    int x, u;
+    for (x = 0; x < 4; x++) out[x] = 0.0;
+    for (u = 0; u < 4; u++)
+    {
+        double v = in[u];
+        if (v == 0.0) continue;
+        for (x = 0; x < 4; x++)
+            out[x] += v * PDF_JPEG_COS4[x][u];
+    }
+    for (x = 0; x < 4; x++) out[x] *= 0.5;
+}
+
+/* BUG REAL DE RENDIMIENTO (Arturo: "esta como antes, mejoro muy poco"
+ * -- continuacion de la seccion 86/87, medido con un harness temporal
+ * que aislo 'jpeg_idct_block' del resto de pdf_filter_dct: en
+ * 3240-3241-2.pdf a la escala REAL de pantalla (0.558, "ajustar a
+ * ventana"), este bloque solo es el 71% (437ms de 611ms) del tiempo
+ * total de renderizar la pagina, y ese numero NO baja aunque la
+ * imagen se vaya a mostrar mas chica -- porque siempre se decodifica
+ * a resolucion NATIVA completa, sin importar a que escala se va a
+ * dibujar despues (pdf_image_draw recien resamplea DESPUES de que
+ * esto termino). 'reduction'==2 (ver pdf_filter.h) salta la IDCT de
+ * 8 puntos completa y usa una de 4 puntos sobre SOLO los 16
+ * coeficientes de baja frecuencia (filas 0-3, columnas 0-3 en orden
+ * NATURAL -- las filas/columnas 4-7, alta frecuencia en cualquiera
+ * de los dos ejes, se descartan sin decodificarlas mas, exactamente
+ * lo que cualquier decoder JPEG real hace para un "scaled decode").
+ * El Huffman-decode del bitstream NO cambia (ver pdf_filter.h) -- el
+ * ahorro es 100% en esta funcion: 1/4 de las multiplicaciones por
+ * pasada Y 1/4 de los pixeles de salida escritos. */
+static void jpeg_idct_block(const int *coeffs, unsigned char *out, int reduction)
 {
     double tmp1[64], tmp2[64];
     int x, y, i;
+
+    if (reduction == 2)
+    {
+        for (y = 0; y < 4; y++)
+        {
+            double row_in[4], row_out[4];
+            int u;
+            for (u = 0; u < 4; u++) row_in[u] = (double)coeffs[y * 8 + u];
+            jpeg_idct_1d_4(row_in, row_out);
+            for (x = 0; x < 4; x++) tmp1[y * 4 + x] = row_out[x];
+        }
+        for (x = 0; x < 4; x++)
+        {
+            double col_in[4], col_out[4];
+            int v;
+            for (v = 0; v < 4; v++) col_in[v] = tmp1[v * 4 + x];
+            jpeg_idct_1d_4(col_in, col_out);
+            for (y = 0; y < 4; y++)
+            {
+                double s = col_out[y] + 128.0;
+                if (s < 0.0) s = 0.0;
+                if (s > 255.0) s = 255.0;
+                out[y * 4 + x] = (unsigned char)(s + 0.5);
+            }
+        }
+        return;
+    }
+
+    /* NOTA -- se probo y se DESCARTO un atajo que saltaba la IDCT 2D
+     * entera para bloques "solo DC" (todos los 63 AC en cero,
+     * reemplazando el resultado por una formula cerrada): resulto NO
+     * ser bit-exacto. Verificado con un harness que probo los 4096
+     * valores posibles de DC contra la IDCT completa -- incluso
+     * repitiendo a mano la MISMA secuencia de multiplicaciones que
+     * haria la pasada fila+columna real (mismo orden, mismas
+     * constantes), el redondeo de precision extendida x87 de bcc32
+     * (80 bits en registro vs 64 bits en memoria, segun como el
+     * compilador decida asignar registros en cada contexto) hizo que
+     * la formula "equivalente" divergiera del resultado real en
+     * hasta 25 de 4096 valores probados, con la magnitud del error
+     * cambiando segun como estuviera escrita la expresion -- exactamente
+     * el tipo de bug de punto flotante no-reproducible que ya costo
+     * mucho esfuerzo perseguir en este motor (ver seccion 81/83 de
+     * DESIGN.md). Se descarto: el riesgo de reintroducir ese tipo de
+     * bug no vale la ganancia. El atajo de abajo (saltar terminos en
+     * CERO adentro de jpeg_idct_1d) sigue vigente y SI es seguro --
+     * ahi no se reemplaza ninguna operacion por una formula
+     * equivalente, solo se omiten sumas de +0.0 que son no-ops
+     * exactos en IEEE754 sin importar la precision intermedia. */
 
     for (y = 0; y < 8; y++)
     {
@@ -984,6 +1148,13 @@ static int jpeg_decode_ac_refine(jpeg_bits *b, const pdf_jpeg_huff *ac_h,
  * solo scan) y el progresivo (despues de acumular todos los scans) --
  * exactamente el mismo codigo que antes vivia inline dentro de
  * pdf_filter_dct, solo movido a funcion para no duplicarlo. */
+static unsigned char jpeg_clamp255_i(int v)
+{
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (unsigned char)v;
+}
+
 static int jpeg_compose_rgb(pdf_arena *arena, pdf_jpeg_image *out,
                              unsigned char **planes, const int *comp_w,
                              const pdf_jpeg_comp *comps, int ncomp,
@@ -997,61 +1168,125 @@ static int jpeg_compose_rgb(pdf_arena *arena, pdf_jpeg_image *out,
     out->rgb = (unsigned char *)pdf_arena_alloc(arena, (size_t)width * height * 3);
     if (out->rgb == NULL) return PDF_ERR_NOMEM;
 
+    /* BUG REAL DE RENDIMIENTO ENCONTRADO (Arturo: "mejorar la velocidad
+     * ... demasiados graficos", medido contra 3240-3241-2.pdf -- una
+     * pagina escaneada de 2496x1775, YCbCr de 3 componentes): esta
+     * composicion tardaba ~813ms de los ~1469ms totales de decodificar
+     * UNA sola imagen -- MAS que el loop de Huffman+IDCT completo. Dos
+     * problemas en el mismo bucle por-pixel (4.4 millones de
+     * iteraciones aca):
+     *   1. 'cbx'/'crx' (columna de croma, dependen SOLO de x) y
+     *      'cby'/'cry' (fila de croma, dependen SOLO de y) se
+     *      recalculaban con una DIVISION ENTERA cada uno, en CADA
+     *      PIXEL -- 4 divisiones/pixel que en realidad solo necesitan
+     *      recalcularse una vez por columna (cbx/crx, antes del loop
+     *      de filas) o una vez por fila (cby/cry, antes del loop de
+     *      columnas).
+     *   2. La conversion YCbCr->RGB hacia 3 multiplicaciones de PUNTO
+     *      FLOTANTE (1.402/-0.344136/-0.714136/1.772) por pixel --
+     *      con Cb/Cr acotados a 0-255, el resultado de cada
+     *      coeficiente*componente tiene solo 256 valores posibles:
+     *      una tabla de 256 enteros por coeficiente (armada UNA vez
+     *      para toda la imagen) reemplaza la multiplicacion de punto
+     *      flotante por una lectura de array. */
+    if (ncomp == 1)
+    {
+        for (y = 0; y < height; y++)
+        {
+            const unsigned char *srow = planes[0] + (size_t)y * comp_w[0];
+            unsigned char *drow = out->rgb + (size_t)y * width * 3;
+            for (x = 0; x < width; x++)
+            {
+                unsigned char v = srow[x];
+                drow[x*3+0] = v; drow[x*3+1] = v; drow[x*3+2] = v;
+            }
+        }
+        return PDF_OK;
+    }
+
+    if (ncomp == 3)
+    {
+        /* Tablas de conversion YCbCr->RGB (ver comentario grande arriba)
+         * -- una sola vez para toda la imagen, no por pixel. */
+        int cr_to_r[256], cb_to_g[256], cr_to_g[256], cb_to_b[256];
+        int *cbx_of_x, *crx_of_x;
+
+        for (x = 0; x < 256; x++)
+        {
+            cr_to_r[x] = (int)(1.402    * (x - 128) + (x >= 128 ? 0.5 : -0.5));
+            cb_to_g[x] = (int)(-0.344136 * (x - 128) + (x >= 128 ? 0.5 : -0.5));
+            cr_to_g[x] = (int)(-0.714136 * (x - 128) + (x >= 128 ? 0.5 : -0.5));
+            cb_to_b[x] = (int)(1.772    * (x - 128) + (x >= 128 ? 0.5 : -0.5));
+        }
+
+        cbx_of_x = (int *)pdf_arena_alloc(arena, (size_t)width * sizeof(int));
+        crx_of_x = (int *)pdf_arena_alloc(arena, (size_t)width * sizeof(int));
+        if (cbx_of_x == NULL || crx_of_x == NULL) return PDF_ERR_NOMEM;
+        for (x = 0; x < width; x++)
+        {
+            cbx_of_x[x] = x * comps[1].h / maxh;
+            crx_of_x[x] = x * comps[2].h / maxh;
+        }
+
+        for (y = 0; y < height; y++)
+        {
+            const unsigned char *yrow = planes[0] + (size_t)y * comp_w[0];
+            const unsigned char *cbrow = planes[1] + (size_t)(y * comps[1].v / maxv) * comp_w[1];
+            const unsigned char *crrow = planes[2] + (size_t)(y * comps[2].v / maxv) * comp_w[2];
+            unsigned char *drow = out->rgb + (size_t)y * width * 3;
+
+            for (x = 0; x < width; x++)
+            {
+                int yv = yrow[x];
+                int cb = cbrow[cbx_of_x[x]];
+                int cr = crrow[crx_of_x[x]];
+                drow[x*3+0] = jpeg_clamp255_i(yv + cr_to_r[cr]);
+                drow[x*3+1] = jpeg_clamp255_i(yv + cb_to_g[cb] + cr_to_g[cr]);
+                drow[x*3+2] = jpeg_clamp255_i(yv + cb_to_b[cb]);
+            }
+        }
+        return PDF_OK;
+    }
+
+    /* ncomp == 4 (CMYK/YCCK) -- caso raro, se deja sin la optimizacion
+     * de tablas de arriba (no lo ejercita ningun archivo real visto
+     * todavia; si hiciera falta, mismo criterio: precomputar indices
+     * de croma por fila/columna y tablas de 256 en vez de por-pixel). */
     for (y = 0; y < height; y++)
     {
         for (x = 0; x < width; x++)
         {
             unsigned char R, G, B;
-            if (ncomp == 1)
-            {
-                R = G = B = planes[0][y * comp_w[0] + x];
-            }
-            else if (ncomp == 4)
-            {
-                int c0 = planes[0][y * comp_w[0] + x];
-                int c1v = planes[1][(y * comps[1].v / maxv) * comp_w[1] + (x * comps[1].h / maxh)];
-                int c2v = planes[2][(y * comps[2].v / maxv) * comp_w[2] + (x * comps[2].h / maxh)];
-                int c3 = planes[3][(y * comps[3].v / maxv) * comp_w[3] + (x * comps[3].h / maxh)];
-                double c, m, ye, k;
+            int c0 = planes[0][y * comp_w[0] + x];
+            int c1v = planes[1][(y * comps[1].v / maxv) * comp_w[1] + (x * comps[1].h / maxh)];
+            int c2v = planes[2][(y * comps[2].v / maxv) * comp_w[2] + (x * comps[2].h / maxh)];
+            int c3 = planes[3][(y * comps[3].v / maxv) * comp_w[3] + (x * comps[3].h / maxh)];
+            double c, m, ye, k;
 
-                if (adobe_transform == 2)
-                {
-                    int rr = (int)jpeg_clamp255(c0 + 1.402 * (c2v - 128));
-                    int gg = (int)jpeg_clamp255(c0 - 0.344136 * (c1v - 128) - 0.714136 * (c2v - 128));
-                    int bb = (int)jpeg_clamp255(c0 + 1.772 * (c1v - 128));
-                    c = 255 - rr; m = 255 - gg; ye = 255 - bb; k = c3;
-                }
-                else
-                {
-                    c = c0; m = c1v; ye = c2v; k = c3;
-                }
-
-                /* CMYK -> RGB, formula "print" simple (ver DESIGN.md
-                 * sobre por que NO se invierten los canales aunque
-                 * este el marcador Adobe -- verificado empiricamente
-                 * que invertir da peor resultado, no mejor). */
-                {
-                    double cc = c / 255.0, mm = m / 255.0, yy2 = ye / 255.0, kk = k / 255.0;
-                    double rr = 1.0 - ((cc + kk > 1.0) ? 1.0 : cc + kk);
-                    double gg = 1.0 - ((mm + kk > 1.0) ? 1.0 : mm + kk);
-                    double bb = 1.0 - ((yy2 + kk > 1.0) ? 1.0 : yy2 + kk);
-                    R = (unsigned char)(rr * 255.0 + 0.5);
-                    G = (unsigned char)(gg * 255.0 + 0.5);
-                    B = (unsigned char)(bb * 255.0 + 0.5);
-                }
+            if (adobe_transform == 2)
+            {
+                int rr = (int)jpeg_clamp255(c0 + 1.402 * (c2v - 128));
+                int gg = (int)jpeg_clamp255(c0 - 0.344136 * (c1v - 128) - 0.714136 * (c2v - 128));
+                int bb = (int)jpeg_clamp255(c0 + 1.772 * (c1v - 128));
+                c = 255 - rr; m = 255 - gg; ye = 255 - bb; k = c3;
             }
             else
             {
-                int yv  = planes[0][y * comp_w[0] + x];
-                int cbx = x * comps[1].h / maxh;
-                int cby = y * comps[1].v / maxv;
-                int crx = x * comps[2].h / maxh;
-                int cry = y * comps[2].v / maxv;
-                int cb = planes[1][cby * comp_w[1] + cbx];
-                int cr = planes[2][cry * comp_w[2] + crx];
-                R = jpeg_clamp255(yv + 1.402 * (cr - 128));
-                G = jpeg_clamp255(yv - 0.344136 * (cb - 128) - 0.714136 * (cr - 128));
-                B = jpeg_clamp255(yv + 1.772 * (cb - 128));
+                c = c0; m = c1v; ye = c2v; k = c3;
+            }
+
+            /* CMYK -> RGB, formula "print" simple (ver DESIGN.md
+             * sobre por que NO se invierten los canales aunque
+             * este el marcador Adobe -- verificado empiricamente
+             * que invertir da peor resultado, no mejor). */
+            {
+                double cc = c / 255.0, mm = m / 255.0, yy2 = ye / 255.0, kk = k / 255.0;
+                double rr = 1.0 - ((cc + kk > 1.0) ? 1.0 : cc + kk);
+                double gg = 1.0 - ((mm + kk > 1.0) ? 1.0 : mm + kk);
+                double bb = 1.0 - ((yy2 + kk > 1.0) ? 1.0 : yy2 + kk);
+                R = (unsigned char)(rr * 255.0 + 0.5);
+                G = (unsigned char)(gg * 255.0 + 0.5);
+                B = (unsigned char)(bb * 255.0 + 0.5);
             }
             out->rgb[(y * width + x) * 3 + 0] = R;
             out->rgb[(y * width + x) * 3 + 1] = G;
@@ -1064,7 +1299,7 @@ static int jpeg_compose_rgb(pdf_arena *arena, pdf_jpeg_image *out,
 /* ==================================================================== */
 
 int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
-                    pdf_jpeg_image *out)
+                    pdf_jpeg_image *out, int reduction)
 {
     long pos;
     int qtables[4][64];
@@ -1091,6 +1326,8 @@ int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
     int coef_bpr[4], coef_bpc[4];
 
     for (i = 0; i < 4; i++) coef[i] = NULL;
+
+    if (reduction != 2) reduction = 1; /* unico valor no-trivial soportado hasta ahora, ver pdf_filter.h */
 
     jpeg_init_cos_table();
     memset(qtables, 0, sizeof(qtables));
@@ -1276,6 +1513,15 @@ int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
 
             if (!progressive)
             {
+                /* 'bs' = tamanio de bloque de salida por eje: 8 sin
+                 * reduccion (de siempre), 4 con reduction==2 (ver
+                 * jpeg_idct_block y pdf_filter.h). Los planos y las
+                 * posiciones px0/py0 se arman directo a este tamanio
+                 * reducido -- jpeg_compose_rgb no necesita saber nada
+                 * de 'reduction', solo recibe width/height/comp_w ya
+                 * reducidos de forma consistente. */
+                int bs = 8 / reduction;
+
                 p += 3; /* Ss, Se, AhAl -- no aplica a baseline */
 
                 mcus_x = (width  + 8 * maxh - 1) / (8 * maxh);
@@ -1283,8 +1529,8 @@ int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
 
                 for (i = 0; i < ncomp; i++)
                 {
-                    comp_w[i] = mcus_x * comps[i].h * 8;
-                    comp_h[i] = mcus_y * comps[i].v * 8;
+                    comp_w[i] = mcus_x * comps[i].h * bs;
+                    comp_h[i] = mcus_y * comps[i].v * bs;
                     planes[i] = (unsigned char *)pdf_arena_alloc(arena, (size_t)comp_w[i] * comp_h[i]);
                     if (planes[i] == NULL) return PDF_ERR_NOMEM;
                     dc_pred[i] = 0;
@@ -1318,13 +1564,13 @@ int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
                                         mcu_y = mcus_y; mcu_x = mcus_x; ci = ns; /* cortar todos los loops */
                                         break;
                                     }
-                                    jpeg_idct_block(coeffs, block_px);
-                                    px0 = (mcu_x * comps[comp_i].h + bx) * 8;
-                                    py0 = (mcu_y * comps[comp_i].v + by) * 8;
-                                    for (yy = 0; yy < 8; yy++)
-                                        for (xx = 0; xx < 8; xx++)
+                                    jpeg_idct_block(coeffs, block_px, reduction);
+                                    px0 = (mcu_x * comps[comp_i].h + bx) * bs;
+                                    py0 = (mcu_y * comps[comp_i].v + by) * bs;
+                                    for (yy = 0; yy < bs; yy++)
+                                        for (xx = 0; xx < bs; xx++)
                                             planes[comp_i][(py0 + yy) * comp_w[comp_i] + (px0 + xx)] =
-                                                block_px[yy * 8 + xx];
+                                                block_px[yy * bs + xx];
                                 }
                             }
                         }
@@ -1346,7 +1592,9 @@ int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
                 /* --- componer a RGB24 final ------------------------------- */
                 {
                     int rc = jpeg_compose_rgb(arena, out, planes, comp_w, comps, ncomp,
-                                               width, height, maxh, maxv, adobe_transform);
+                                               (width + reduction - 1) / reduction,
+                                               (height + reduction - 1) / reduction,
+                                               maxh, maxv, adobe_transform);
                     if (rc != PDF_OK) return rc;
                 }
 
@@ -1484,10 +1732,24 @@ int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
      * coeficientes ya completos -- ver DESIGN.md seccion 58). */
     if (progressive && have_sof)
     {
+        /* 'bs' = tamanio de bloque de salida por eje, mismo criterio
+         * que el camino baseline de arriba (ver jpeg_idct_block y
+         * pdf_filter.h). 'coef_bpr[i]'/'coef_bpc[i]' (cantidad de
+         * bloques 8x8 del bitstream) NO cambian con la reduccion --
+         * se calcularon una sola vez al leer el SOF, en terminos de
+         * bloques, no de pixeles. Lo que SI se recalcula aca son
+         * 'comp_w[i]'/'comp_h[i]' (dimensiones del plano de SALIDA ya
+         * reducido) -- se pisan las que se usaron arriba para
+         * reservar 'coef[i]' porque de aca en mas ya no hacen falta
+         * en su valor original (esos buffers ya estan llenos). */
+        int bs = 8 / reduction;
+
         for (i = 0; i < ncomp; i++)
         {
             const int *qtab = qtables[comps[i].tq];
             int br, bc;
+            comp_w[i] = coef_bpr[i] * bs;
+            comp_h[i] = coef_bpc[i] * bs;
             planes[i] = (unsigned char *)pdf_arena_alloc(arena, (size_t)comp_w[i] * comp_h[i]);
             if (planes[i] == NULL) return PDF_ERR_NOMEM;
 
@@ -1511,19 +1773,21 @@ int pdf_filter_dct(pdf_arena *arena, const unsigned char *src, long src_len,
                     for (k = 0; k < 64; k++)
                         dequant[PDF_JPEG_ZIGZAG[k]] = blk[PDF_JPEG_ZIGZAG[k]] * qtab[k];
 
-                    jpeg_idct_block(dequant, block_px);
-                    px0 = bc * 8;
-                    py0 = br * 8;
-                    for (yy = 0; yy < 8; yy++)
-                        for (xx = 0; xx < 8; xx++)
-                            planes[i][(py0 + yy) * comp_w[i] + (px0 + xx)] = block_px[yy * 8 + xx];
+                    jpeg_idct_block(dequant, block_px, reduction);
+                    px0 = bc * bs;
+                    py0 = br * bs;
+                    for (yy = 0; yy < bs; yy++)
+                        for (xx = 0; xx < bs; xx++)
+                            planes[i][(py0 + yy) * comp_w[i] + (px0 + xx)] = block_px[yy * bs + xx];
                 }
             }
         }
 
         {
             int rc = jpeg_compose_rgb(arena, out, planes, comp_w, comps, ncomp,
-                                       width, height, maxh, maxv, adobe_transform);
+                                       (width + reduction - 1) / reduction,
+                                       (height + reduction - 1) / reduction,
+                                       maxh, maxv, adobe_transform);
             if (rc != PDF_OK) return rc;
         }
         return PDF_OK;

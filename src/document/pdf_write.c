@@ -61,40 +61,23 @@ static long find_last_startxref(FILE *fp, long file_size)
  * ==================================================================== */
 
 /* Busca el diccionario de linealizacion -- por norma (ISO 32000-1
- * Anexo F.2) es SIEMPRE el primer objeto indirecto fisico del
- * archivo, justo despues de la linea de cabecera "%PDF-M.N" y de
- * cualquier linea de comentario binario que la siga (empieza con '%',
- * convencion estandar para marcar el archivo binary-safe). No hace
- * falta buscarlo por numero de objeto -- se identifica por POSICION,
- * exactamente como lo hace cualquier lector conforme.
+ * Anexo F.2) es SIEMPRE el primer objeto fisico del archivo, justo
+ * despues de "%PDF-M.N" y de cualquier linea de comentario binario que
+ * la siga -- se identifica por POSICION, no por numero de objeto,
+ * igual que cualquier lector conforme.
  *
- * BUG REAL ENCONTRADO (Arturo: "no me permite abrir el pdf en
- * acrobat" -- error real de Adobe Acrobat Reader, "Problema al leer
- * el documento (14)"): un PDF linealizado declara en este diccionario
- * /L = tamano TOTAL del archivo en el momento en que se linealizo.
- * pdf_write_incremental_update() NUNCA toca los bytes originales (esa
- * es la gracia de una actualizacion incremental) -- asi que ese /L
- * queda desactualizado para siempre en cuanto se agrega la PRIMERA
- * anotacion/campo de formulario y se guarda. Herramientas tolerantes
- * (pypdf, qpdf, MuPDF -- las 3 probadas explicitamente) ignoran el /L
- * viejo sin problema y siguen leyendo el archivo bien. Adobe Acrobat
- * Reader real, en la practica, NO: un PDF linealizado con una sola
- * actualizacion incremental encima (exactamente el resultado de
- * CUALQUIER "Guardar" de este motor) dejaba de poder abrirse.
- * Confirmado reproduciendo el escenario exacto contra un PDF real
- * (tests/hot corrocion.pdf, linealizado de origen) y comparando
- * contra una reescritura limpia via qpdf (que SI abrio bien en
- * Acrobat, aislando el problema a la linealizacion stale y no a
- * ninguna otra parte de la sintaxis -- confirmado por Arturo
- * directamente contra Acrobat real).
+ * Hace falta neutralizarlo en cada guardado incremental: declara /L
+ * (tamano total del archivo al momento de linealizar), que queda
+ * desactualizado para siempre apenas se agrega la primera anotacion.
+ * Herramientas tolerantes lo ignoran, pero Acrobat real rechaza abrir
+ * el resultado -- ver DESIGN.md seccion 79 para el bug real y como se
+ * confirmo.
  *
- * Devuelve 1 si encontro un diccionario de linealizacion TODAVIA
- * activo (con la clave /Linearized presente en su valor YA RESUELTO
- * -- se consulta a traves de pdf_xref_load_object(), que devuelve la
- * version cacheada/mutada si un guardado anterior en esta misma
- * sesion ya lo neutralizo, para no volver a tocarlo en cada guardado
- * sucesivo) y llena '*out_num'/'*out_gen'. Devuelve 0 si el archivo no
- * es un PDF linealizado, o si ya fue neutralizado antes. */
+ * Consulta el valor YA RESUELTO (via pdf_xref_load_object, que
+ * devuelve la version cacheada si un guardado anterior en esta sesion
+ * ya lo neutralizo). Devuelve 1 y llena '*out_num'/'*out_gen' si
+ * encontro uno todavia activo, 0 si no es linealizado o ya fue
+ * neutralizado. */
 static int detect_active_linearization(pdf_stream *st, const pdf_xref_table *xref,
                                         pdf_arena *arena, long *out_num, long *out_gen)
 {
@@ -302,14 +285,9 @@ static void write_indirect_object(FILE *out, pdf_obj *obj, long num, long gen)
     }
     else
     {
-        /* BUG REAL ENCONTRADO (fase de resaltado de texto, ver DESIGN.md):
-         * esta rama solo sabia serializar PDF_DICT -- si se marca como
-         * "tocado" un objeto PDF_ARRAY (caso real: /Annots de una pagina
-         * guardado como referencia indirecta a un array suelto, layout
-         * comun en PDFs reales), escribia "<< >>" (dict vacio) en vez del
-         * array, perdiendo TODO su contenido anterior. write_obj_value ya
-         * distingue PDF_DICT/PDF_ARRAY/etc correctamente -- para PDF_DICT
-         * el resultado es identico a antes (misma write_dict_entries). */
+        /* write_obj_value ya distingue PDF_DICT/PDF_ARRAY/etc -- antes
+         * esta rama solo sabia PDF_DICT y perdia cualquier /Annots
+         * tocado guardado como array suelto (ver DESIGN.md seccion 78). */
         write_obj_value(out, obj);
         fprintf(out, "\nendobj\n");
     }
@@ -358,20 +336,12 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
     if (prev_xref_offset < 0)
         return PDF_ERR_BADARG; /* no se pudo determinar el xref original -- no seguir a ciegas */
 
-    /* PDF linealizado con /L (tamano de archivo) desactualizado por la
-     * actualizacion incremental que esta funcion esta a punto de
-     * escribir -- ver el comentario grande junto a
-     * detect_active_linearization() mas arriba (bug real: Acrobat
-     * rechazaba abrir el resultado, "Problema al leer el documento
-     * (14)", aunque pypdf/qpdf/MuPDF lo leian bien). Si se detecta, se
-     * agrega el diccionario de linealizacion a la lista de tocados con
-     * un reemplazo vacio -- un slot mas alla de lo que goto el
-     * llamador, por eso se arman arrays LOCALES (en 'arena') en vez de
-     * escribir sobre los del llamador. Si 'arena' fallara la
-     * alocacion, o si ya no queda lugar (n_touched al tope de 4096,
-     * practicamente imposible en el uso real), se seguia igual con la
-     * lista original SIN neutralizar -- mejor guardar sin arreglar la
-     * linealizacion que no guardar nada. */
+    /* Neutraliza una linealizacion stale si la hay (ver
+     * detect_active_linearization arriba y DESIGN.md seccion 79) --
+     * arrays LOCALES (en 'arena') con un slot extra, para no escribir
+     * sobre los del llamador. Si la alocacion fallara, sigue con la
+     * lista original sin neutralizar (mejor guardar sin arreglar la
+     * linealizacion que no guardar nada). */
     eff_touched_objs = touched_objs;
     eff_touched_nums = touched_nums;
     eff_touched_gens = touched_gens;
@@ -475,27 +445,13 @@ int pdf_write_incremental_update(pdf_stream *st, const pdf_xref_table *xref,
 
     fclose(out_fp);
 
-    /* BUG REAL ENCONTRADO Y ARREGLADO (Arturo: "Guardar dice que no hay
-     * cambios pendientes" pese a que 'h->n_touched' era 2 y el
-     * documento no estaba encriptado -- confirmado leyendo el codigo Y
-     * reproducido con un harness aislado: pdf_write_incremental_update
-     * devolvia PDF_ERR_IO al escribir sobre el MISMO archivo que 'st'
-     * todavia tenia ABIERTO para lectura, exactamente el caso real de
-     * "Guardar" -- el documento sigue abierto para mostrarse en pantalla
-     * mientras se intenta sobrescribir 'out_path'). En Windows, ni
-     * siquiera el mismo proceso puede renombrar/reemplazar un archivo
-     * que tiene un handle abierto via fopen() sin FILE_SHARE_DELETE --
-     * los dos rename() de abajo fallaban SIEMPRE en este escenario,
-     * silenciosamente (el primero se ignora a proposito, el segundo
-     * devolvia PDF_ERR_IO). Fix: cerrar el handle de lectura de 'st'
-     * ANTES de la danza de renames (ya se termino de leer todo lo que
-     * hacia falta del original, arriba) y volver a abrirlo AL FINAL,
-     * apuntando a donde haya terminado el archivo (el nuevo contenido
-     * si todo salio bien, o el original restaurado si algo fallo) --
-     * reusa pdf_stream_open() tal cual, ya probado, en vez de reimplementar
-     * a mano el reset de buffer/tamanio de 'st'. El llamador (Pdf_FormSave)
-     * sigue usando el MISMO 'st' con normalidad despues de este llamado
-     * (el documento sigue abierto para seguir viendolo/navegandolo). */
+    /* Cerrar el handle de lectura de 'st' ANTES de la danza de rename()
+     * de abajo y reabrirlo AL FINAL (via pdf_stream_open, ya probado) --
+     * en Windows ni el mismo proceso puede reemplazar un archivo con un
+     * handle abierto sin FILE_SHARE_DELETE (bug real: "Guardar" fallaba
+     * siempre que el documento seguia abierto en pantalla, el caso
+     * normal -- ver DESIGN.md seccion 78). El llamador sigue usando el
+     * MISMO 'st' con normalidad despues de este llamado. */
     fclose(in_fp);
     {
         FILE *null_fp = NULL;

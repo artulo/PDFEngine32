@@ -102,24 +102,54 @@
 #define LOGPIXELSY 90
 
 // Diagnostico de BuildComposite() -- agrega una linea a pdfview_debug.log
-// en el directorio de trabajo (se borra/reinicia cada vez que arranca
-// pdf_demo.exe, ver PdfViewLogReset() en Main -- pdf_demo.prg). Nacio
-// para diagnosticar por que el modo continuo no entraba contra un
-// documento real (Arturo: "no hace lo que decis" -- termino siendo el
-// gate de tiempo/dimensiones funcionando bien, y despues un crash real
-// por SRCCOPY sin definir, ver DESIGN.md 70.2) -- se dejaron solo las
-// lineas de nivel "gate" (una por llamada a BuildComposite(), no una
-// por pagina) porque siguen siendo utiles para diagnosticar sin
-// esfuerzo por que un documento puntual no entra en modo continuo.
+// en el directorio de trabajo. Nacio para diagnosticar por que el modo
+// continuo no entraba contra un documento real (Arturo: "no hace lo
+// que decis" -- termino siendo el gate de tiempo/dimensiones
+// funcionando bien, y despues un crash real por SRCCOPY sin definir,
+// ver DESIGN.md 70.2) -- se dejaron solo las lineas de nivel "gate"
+// (una por llamada a BuildComposite(), no una por pagina) porque siguen
+// siendo utiles para diagnosticar sin esfuerzo por que un documento
+// puntual no entra en modo continuo.
+//
+// Arturo: "podemos hacer que no se genere el pdfview_debug.log" --
+// ahora es OPT-IN via la variable de entorno PDFVIEW_DEBUG_LOG (mismo
+// criterio que PDF_JPX_DEBUG/etc del lado C, ver DESIGN.md seccion 90):
+// sin esa variable seteada, ni PdfViewLogReset() ni PdfViewLogDebug()
+// tocan el archivo para nada -- no se crea ni se pisa uno que ya
+// exista de una sesion anterior. Para reactivar el diagnostico (p.ej.
+// para investigar por que un documento puntual no entra en modo
+// continuo), correr pdf_demo.exe con esa variable seteada a cualquier
+// valor no vacio. El chequeo de GetEnv() se cachea (una sola vez por
+// corrida) en vez de un getenv() sin cachear por cada linea -- mismo
+// antipatron de rendimiento ya encontrado y sacado del lado C en la
+// limpieza de la seccion 90.
+STATIC s_lPdfViewLogChecked := .F.
+STATIC s_lPdfViewLogOn      := .F.
+
+STATIC FUNCTION PdfViewLogEnabled()
+   IF ! s_lPdfViewLogChecked
+      s_lPdfViewLogOn      := ! Empty( GetEnv( "PDFVIEW_DEBUG_LOG" ) )
+      s_lPdfViewLogChecked := .T.
+   ENDIF
+RETURN s_lPdfViewLogOn
+
 FUNCTION PdfViewLogReset()
-   LOCAL hFile := FCreate( "pdfview_debug.log" )
+   LOCAL hFile
+   IF ! PdfViewLogEnabled()
+      RETURN nil
+   ENDIF
+   hFile := FCreate( "pdfview_debug.log" )
    IF hFile != -1
       FClose( hFile )
    ENDIF
 RETURN nil
 
 FUNCTION PdfViewLogDebug( cMsg )
-   LOCAL hFile := FOpen( "pdfview_debug.log", 1 )   // FO_WRITE = 1
+   LOCAL hFile
+   IF ! PdfViewLogEnabled()
+      RETURN nil
+   ENDIF
+   hFile := FOpen( "pdfview_debug.log", 1 )   // FO_WRITE = 1
    IF hFile == -1
       hFile := FCreate( "pdfview_debug.log" )
    ENDIF
@@ -240,30 +270,15 @@ METHOD KeyDown( nKey, nFlags ) CLASS TPdfFormGet
 return ::Super:KeyDown( nKey, nFlags )
 
 //----------------------------------------------------------------------------//
-// TPdfTipEdit -- mensaje de un globo de tip (ver TPdfBitmap:StartTipEntry
-// mas abajo). Arturo: "sale pero no se queda con enter... debe ser
-// multiline" -- 2 correcciones reales sobre el primer intento (que usaba
-// un TPdfTipGet FROM TGet, de una sola linea):
-//
-// 1) BUG REAL: TGet:KeyDown() interceptaba VK_RETURN y llamaba
-//    CommitTipEntry() SIN pasar por ::Super:KeyDown() -- pero el volcado
-//    del buffer editado al bSetGet vinculado (Assign(), tget.prg linea
-//    3064) solo pasa DENTRO de LostFocus() o de la logica interna de
-//    KeyDown que nunca llegabamos a ejecutar (la cortabamos antes con
-//    "return 0"). Resultado: Enter "cerraba" el cuadro pero
-//    ::cTipValue seguia vacio (el Space(200) inicial), asi que
-//    CommitTipEntry() nunca encontraba texto para guardar. Fix: pasar a
-//    TEdit (mismo problema de fondo, pero con un metodo Read() propio y
-//    EXPLICITO, ver mas abajo) y llamarlo SIEMPRE antes de leer
-//    ::cTipValue en CommitTipEntry -- no importa por que camino se
-//    llego ahi (Enter, Ctrl+Enter, perdida de foco).
-//
-// 2) Multilinea: TEdit con lMultiLine (edit.prg linea 128-129) agrega
-//    ES_WANTRETURN -- el control mismo consume Enter como salto de
-//    linea (no como "enviar"), asi que hace falta otra tecla para
-//    confirmar: Ctrl+Enter (convencion comun -- Enter para nueva linea,
-//    Ctrl+Enter para confirmar, igual que muchos chats). ESC sigue
-//    cancelando sin persistir.
+// TPdfTipEdit -- mensaje de un globo de tip, multilinea (ver
+// TPdfBitmap:StartTipEntry mas abajo). Con lMultiLine, TEdit agrega
+// ES_WANTRETURN -- Enter solo es salto de linea, asi que confirmar es
+// Ctrl+Enter (Enter para nueva linea, igual que muchos chats). ESC
+// cancela sin persistir. CommitTipEntry() llama oGet:Read() explicito
+// antes de leer el valor (bug real corregido -- ver DESIGN.md seccion
+// 78: un TGet de una sola linea perdia el texto tipeado si se
+// confirmaba con Enter, porque TGet:KeyDown() nunca llegaba a volcar el
+// buffer editado sin pasar por LostFocus()).
 //----------------------------------------------------------------------------//
 
 CLASS TPdfTipEdit FROM TEdit
@@ -369,34 +384,27 @@ CLASS TPdfBitmap FROM TBitmap
    DATA hDrawPen
 
    // Globo de tip -- NO es un arrastre: un solo clic arma un TEdit
-   // dinamico (::oTipGet, ver TPdfTipEdit arriba) ahi mismo para
-   // escribir el mensaje, sea con "Tip" armado (::oViewer:cDrawMode ==
-   // "TIP") o con un clic directo sobre un globo YA existente (ver
-   // LButtonDown -- Arturo: "no se puede modificar" -- edicion sin
-   // necesidad de armar el boton "Tip" primero). ::nTipStartRow/Col
-   // guarda el punto clickeado (fila/columna de CONTROL) para
-   // convertirlo a espacio de pagina recien al confirmar.
-   // ::lTipEditing distingue "creando uno nuevo" de "editando uno que
-   // ya existia en ese punto" -- en edicion, confirmar borra el viejo
-   // y agrega uno nuevo con el texto actualizado (ver CommitTipEntry);
-   // ESC en edicion deja el original SIN TOCAR (nunca se llega a
-   // borrar nada hasta confirmar).
+   // dinamico (::oTipGet, ver TPdfTipEdit arriba) ahi mismo, sea con
+   // "Tip" armado o con un clic directo sobre un globo YA existente
+   // (ver LButtonDown, sin necesidad de armar el boton primero).
+   // ::nTipStartRow/Col guarda el punto clickeado para convertirlo a
+   // espacio de pagina al confirmar. ::lTipEditing distingue "creando
+   // uno nuevo" de "editando uno existente" -- en edicion, confirmar
+   // borra el viejo y agrega uno nuevo con el texto actualizado (ver
+   // CommitTipEntry); ESC en edicion deja el original sin tocar.
    DATA oTipGet
    DATA nTipStartRow
    DATA nTipStartCol
    DATA cTipValue
    DATA lTipEditing     INIT .F.
 
-   // Mover un globo existente (Arturo: "debe permitirse que se pueda
-   // mover la posicion") -- arrancado por un click sobre un tip YA
-   // existente (ver LButtonDown), pero la decision real (fue un click =
-   // editar en el lugar de siempre, o fue un arrastre = mover) se toma
-   // en LButtonUp segun cuanto se movio el mouse (mismo umbral en
-   // PIXELES que el guard de arrastre-minimo de las 4 formas).
-   // ::cTipMoveText guarda el texto del globo (leido en el momento del
-   // click) para poder re-agregarlo tal cual en el punto nuevo si
-   // termina siendo un arrastre -- "mover" es "borrar en el origen +
-   // agregar en el destino", mismo criterio que "editar" ya usa.
+   // Mover un globo existente -- arrancado por un click sobre un tip
+   // YA existente, pero la decision real (click=editar, arrastre=mover)
+   // se toma en LButtonUp segun cuanto se movio el mouse (mismo umbral
+   // que el guard de arrastre-minimo de las formas). ::cTipMoveText
+   // guarda el texto para re-agregarlo en el punto nuevo si es un
+   // arrastre -- "mover" es "borrar en el origen + agregar en el
+   // destino", mismo criterio que "editar".
    DATA lTipMoving       INIT .F.
    DATA nTipMoveStartRow
    DATA nTipMoveStartCol
@@ -712,8 +720,13 @@ return nRes
 //----------------------------------------------------------------------------//
 
 METHOD SyncCurPage() CLASS TPdfBitmap
+   local nNewPage
    if ::oViewer != nil .and. ::oViewer:lContinuousMode
-      ::oViewer:nCurPage := ::oViewer:PageAtOffsetY( -::nX )
+      nNewPage := ::oViewer:PageAtOffsetY( -::nX )
+      if nNewPage != ::oViewer:nCurPage
+         ::oViewer:nCurPage := nNewPage
+         ::oViewer:NotifyPageChange()   // rueda/scrollbar en vista continua NO pasan por GoToPage() -- ver DATA bOnPageChange
+      endif
    endif
 return nil
 
@@ -829,17 +842,12 @@ METHOD LButtonDown( nRow, nCol, nKeyFlags ) CLASS TPdfBitmap
          endif
       endif
 
-      // Formas libres/Tip armados (::oViewer:cDrawMode != NIL, botones
-      // "Linea"/"Rectangulo"/"Circulo"/"Tinta"/"Tip" de la toolbar, ver
-      // DESIGN.md) -- con una herramienta de dibujo armada, la
-      // intencion del click SIEMPRE es "dibujar/anotar aca", nunca
-      // "de paso, borrame este resaltado" -- por eso este chequeo va
-      // ANTES del hit-test de borrar-resaltado (AJUSTE: antes iba
-      // despues, y un click sobre un resaltado existente con una
-      // herramienta armada lo borraba en vez de dibujar ahi -- bug
-      // real encontrado al agregar el globo de tip, afectaba tambien
-      // a las 4 formas ya enviadas). Sigue yendo DESPUES de AcroForm
-      // (un campo editable siempre gana si se solapan).
+      // Formas libres/Tip armados (::oViewer:cDrawMode != NIL) -- con
+      // una herramienta armada, la intencion del click SIEMPRE es
+      // "dibujar/anotar aca", por eso va ANTES de borrar-resaltado
+      // (bug real corregido: antes iba despues y un click con una
+      // herramienta armada podia borrar en vez de dibujar). Sigue
+      // yendo DESPUES de AcroForm.
       if ::oViewer != nil .and. ::oViewer:cDrawMode != nil
 
          if ::oViewer:cDrawMode == "TIP"
@@ -858,48 +866,28 @@ METHOD LButtonDown( nRow, nCol, nKeyFlags ) CLASS TPdfBitmap
          return 0
       endif
 
-      // Borrar resaltado (Arturo: "vamos por las anotaciones" -> borrar/
-      // deshacer un resaltado, ver DESIGN.md) -- click sobre un /Highlight
-      // existente lo borra directo, mismo espiritu que cualquier visor de
-      // PDF real (click en la marca para sacarla). Prioridad DESPUES de
-      // AcroForm y de cualquier herramienta de dibujo armada (arriba),
-      // pero ANTES de arrancar una seleccion de texto nueva -- si no cae
-      // sobre ningun resaltado, sigue exactamente el comportamiento de
-      // siempre.
+      // Borrar resaltado -- click directo sobre un /Highlight existente
+      // lo saca, sin modo que armar. Prioridad DESPUES de AcroForm y de
+      // cualquier herramienta armada, ANTES de arrancar una seleccion.
       if Pdf_AnnotDeleteHighlightAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
          ::oViewer:RefreshRenderPage( aP[ 1 ] )
          return 0
       endif
 
       // Borrar una forma libre existente (Linea/Rectangulo/Circulo/
-      // Tinta -- Arturo: "es posible eliminar circulo rectangulos
-      // lineas tintas") -- click directo la borra, mismo espiritu que
-      // borrar-resaltado arriba (a diferencia del globo de tip, estas
-      // formas no tienen texto que editar, asi que no hace falta
-      // distinguir click-de-arrastre: un click siempre borra, sin
-      // ningun modo que armar). Prioridad DESPUES de borrar-resaltado y
-      // ANTES de tip -- si no cae sobre ninguna forma, sigue el
-      // comportamiento de siempre.
+      // Tinta) -- a diferencia del tip, no tienen texto que editar, asi
+      // que un click siempre borra, sin distinguir click de arrastre.
       if Pdf_AnnotDeleteShapeAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
          ::oViewer:RefreshRenderPage( aP[ 1 ] )
          return 0
       endif
 
-      // Editar/mover un globo de tip existente (Arturo: "no se puede
-      // modificar", despues "debe permitirse que se pueda mover la
-      // posicion") -- funciona SIN necesidad de armar el boton "Tip"
-      // primero, mismo espiritu que borrar-resaltado arriba (un click
-      // directo alcanza). Si ninguna herramienta de dibujo esta armada
-      // (si "Tip" SI esta armado, esto ya lo maneja StartTipEntry mas
-      // arriba -- ahi un clic SIEMPRE abre/crea en el punto exacto, sin
-      // distincion de arrastre) y el click cae sobre un globo existente,
-      // arma un posible arrastre (::lTipMoving) en vez de decidir ya
-      // mismo -- LButtonUp es quien recien ahi distingue "fue un click"
-      // (abrir para editar en el punto ORIGINAL, comportamiento de
-      // siempre) de "fue un arrastre" (mover el globo al punto nuevo,
-      // mismo texto) segun cuanto se movio el mouse. Si no hay ningun
-      // tip ahi, sigue el comportamiento de siempre (seleccion de
-      // texto).
+      // Editar/mover un globo de tip existente, sin necesidad de armar
+      // "Tip" primero (si "Tip" SI esta armado, StartTipEntry mas arriba
+      // ya lo resuelve). Arma un posible arrastre (::lTipMoving) sin
+      // decidir nada todavia -- LButtonUp distingue "click" (editar en
+      // el lugar de siempre) de "arrastre" (mover) segun cuanto se movio
+      // el mouse.
       cTipText := Pdf_AnnotGetTipAt( ::oViewer:pDoc, aP[ 1 ], aP[ 2 ], aP[ 3 ] )
       if cTipText != nil
          ::lTipMoving       := .T.
@@ -1508,18 +1496,12 @@ return nil
 //----------------------------------------------------------------------------//
 // Globo de tip -- un solo clic (no arrastre, ver LButtonDown) arma un TEdit
 // dinamico EXACTO en (nRow,nCol) (a diferencia de StartFieldEdit, que
-// posiciona el control segun el /Rect de un campo YA existente, aca el
-// click mismo define la posicion -- no hay ningun rectangulo previo del
-// que partir).
+// posiciona el control segun el /Rect de un campo YA existente).
 //
 // Si el click cae sobre un globo YA existente (Pdf_AnnotGetTipAt, ver
 // pdf_hbfunc.c), se precarga su texto actual y se arma ::lTipEditing --
-// Arturo: "no se puede modificar" -- CommitTipEntry() se encarga de
-// borrar el viejo y agregar uno nuevo con el texto actualizado (ver mas
-// abajo). Se llama tanto con "Tip" armado (click en cualquier lado) como
-// SIN ningun modo armado (click directo sobre un globo existente, ver
-// LButtonDown) -- en ese segundo caso, si NO hay ningun globo ahi, el
-// llamador ni siquiera invoca este metodo (ver LButtonDown).
+// CommitTipEntry() se encarga de borrar el viejo y agregar uno nuevo con
+// el texto actualizado (ver mas abajo).
 //----------------------------------------------------------------------------//
 
 METHOD StartTipEntry( nRow, nCol ) CLASS TPdfBitmap
@@ -1542,17 +1524,11 @@ METHOD StartTipEntry( nRow, nCol ) CLASS TPdfBitmap
       endif
    endif
 
-   // BUG REAL ENCONTRADO (crash confirmado con error.log real, Arturo):
    // TEdit:New() (edit.prg linea 138-143) evalua If(lRight,...)/
-   // If(lCenter,...)/If(lNumber,...)/If(lUpper,...) SIN ningun DEFAULT
-   // que los proteja de NIL (a diferencia de lMultiLine/lReadOnly/
-   // lPassword, que SI tienen DEFAULT ... := .F. mas arriba en el mismo
-   // metodo, linea 109) -- omitir esos parametros posicionales (dejar
-   // que Harbour los mande como NIL) hace que If() truene con "Argument
-   // error: conditional" apenas se intenta crear el control. Hay que
-   // pasar EXPLICITO hasta la ultima posicion que el metodo lee sin
-   // proteccion (lUpper, posicion 19) -- no alcanza con parar en
-   // lMultiLine (13) como en el primer intento.
+   // If(lCenter,...)/If(lNumber,...)/If(lUpper,...) sin DEFAULT que los
+   // proteja de NIL -- crash real confirmado por error.log ("Argument
+   // error: conditional") al omitir esos posicionales. Hay que pasar
+   // explicito hasta la ultima posicion sin proteger (lUpper, #19).
    ::oTipGet := TPdfTipEdit():New( nRow, nCol, ;
       {| u | if( u == nil, ::cTipValue, ::cTipValue := u ) }, ;
       ::oWnd, 220, 70, .T., NIL, NIL, NIL, NIL, NIL, .T., ;
@@ -1765,6 +1741,17 @@ CLASS TPdfViewer
    DATA nPageCount    INIT 0                     // total de paginas del documento (0 = nada abierto)
    DATA nCurPage      INIT 0                     // pagina actual, 1-based
 
+   // Callback opcional (codeblock, recibe la pagina 1-based nueva) para que
+   // el caller (pdf_demo.prg) mantenga su propio indicador de "Pagina:"
+   // sincronizado -- ::nCurPage tambien cambia por caminos que NO pasan por
+   // un boton del toolbar (rueda del mouse, scrollbar, saltar de pagina al
+   // llegar al borde en modo de una pagina, Buscar/Anterior/Siguiente), asi
+   // que el demo no se enteraba y el numero de pagina en pantalla quedaba
+   // desactualizado hasta el proximo click de un boton. Se dispara SOLO
+   // cuando ::nCurPage realmente cambia de valor (ver GoToPage() y
+   // TPdfBitmap:SyncCurPage() mas abajo).
+   DATA bOnPageChange INIT NIL
+
    DATA nZoomMode     INIT PDFVIEWER_ZOOM_FITHEIGHT
    DATA nScale        INIT 1.0                   // escala efectiva (puntos PDF -> pixeles) del ultimo render aplicado
    DATA nZoomPercent  INIT 100                    // solo tiene sentido bajo PDFVIEWER_ZOOM_CUSTOM, ver ZoomIn()/ZoomOut()
@@ -1844,6 +1831,7 @@ CLASS TPdfViewer
    METHOD GoToPage( nPage )                       // .T./.F.
    METHOD NextPage()   INLINE ::GoToPage( ::nCurPage + 1 )
    METHOD PrevPage()   INLINE ::GoToPage( ::nCurPage - 1 )
+   METHOD NotifyPageChange() INLINE if( ::bOnPageChange != NIL, Eval( ::bOnPageChange, ::nCurPage ), NIL )
    METHOD FirstPage()  INLINE ::GoToPage( 1 )
    METHOD LastPage()   INLINE ::GoToPage( ::nPageCount )
 
@@ -1853,7 +1841,7 @@ CLASS TPdfViewer
    METHOD ZoomIn()                                // +25% (PDFVIEWER_ZOOM_PERCENT_STEP), tope PDFVIEWER_ZOOM_PERCENT_MAX
    METHOD ZoomOut()                                // -25%, piso PDFVIEWER_ZOOM_PERCENT_MIN
 
-   METHOD RotatePage()                             // ::nUserRotate += 90 (mod 360) y vuelve a renderizar
+   METHOD RotatePage( nDegrees )                   // ::nUserRotate += nDegrees (DEFAULT 90, mod 360) y vuelve a renderizar -- negativo = a la izquierda
 
    METHOD Resize( nWidth, nHeight )                // el caller lo invoca desde ON RESIZE de oWnd (ver pdf_demo.prg)
    METHOD Refresh() INLINE ::RenderCurrentPage()   // fuerza volver a renderizar la pagina actual con el modo/escala vigente
@@ -1876,22 +1864,28 @@ CLASS TPdfViewer
 
    // Formas libres (Linea/Rectangulo/Circulo/Tinta, ver DESIGN.md) --
    // NIL = modo normal (seleccion de texto de siempre); "LINE"/"RECT"/
-   // "CIRCLE"/"INK" = modo dibujo armado, consultado por
+   // "CIRCLE"/"INK"/"TIP" = modo dibujo armado, consultado por
    // TPdfBitmap:LButtonDown/MouseMove/LButtonUp. Se desactiva SOLO al
-   // terminar una forma (decision confirmada con Arturo: como Acrobat,
-   // no como AutoCAD/DWGEngine -- evita dejar el modo armado por
-   // accidente mientras el usuario vuelve a leer/seleccionar texto) --
-   // el boton "Normal" (pdf_demo.prg) y ESC tambien lo desarman a mano.
+   // terminar una forma (como Acrobat, no como AutoCAD) -- el boton
+   // "Normal" (pdf_demo.prg) y ESC tambien lo desarman a mano.
    DATA cDrawMode INIT NIL
    METHOD StartDrawMode( cType ) INLINE ::cDrawMode := cType
    METHOD StopDrawMode()         INLINE ::cDrawMode := NIL
 
    // busqueda (Etapa 5): Find() arranca una busqueda nueva desde la pagina
-   // actual; FindNext() avanza al siguiente match (dentro de la misma
-   // pagina si quedan mas, si no a la proxima pagina que tenga alguno, con
-   // wrap al llegar al final -- ver implementacion mas abajo).
+   // actual; FindNext()/FindPrev() avanzan/retroceden al match
+   // siguiente/anterior (dentro de la misma pagina si quedan mas, si no a
+   // la proxima/anterior pagina que tenga alguno, con wrap al llegar a una
+   // punta -- ver implementacion mas abajo). SearchNext()/SearchPrev() son
+   // el punto de entrada pensado para la UI (ver pdf_demo.prg): arman la
+   // busqueda solos si el texto cambio (o no habia ninguna activa) y
+   // avanzan/retroceden -- no hace falta un boton "Buscar" aparte.
    METHOD Find( cNeedle, lCaseSensitive )          // .T. si encontro algo
    METHOD FindNext()                               // .T. si encontro algo
+   METHOD FindPrev()                               // .T. si encontro algo
+   METHOD SearchNext( cNeedle, lCaseSensitive )    // .T. si encontro algo -- arma sola si hace falta
+   METHOD SearchPrev( cNeedle, lCaseSensitive )    // .T. si encontro algo -- arma sola si hace falta
+   METHOD ArmFind( cNeedle, lCaseSensitive )       // interno -- resetea el estado de busqueda, sin buscar todavia
    METHOD ClearFind()                              // cancela la busqueda activa y el resaltado
 
    // Impresion (Arturo: "un proceso para lanzar el documento a
@@ -2060,7 +2054,10 @@ METHOD GoToPage( nPage ) CLASS TPdfViewer
    // que descartar una seleccion que el usuario dejo hecha en otra
    // pagina del mismo compuesto.
    if ::lContinuousMode
-      ::nCurPage := nPage
+      if nPage != ::nCurPage
+         ::nCurPage := nPage
+         ::NotifyPageChange()
+      endif
       if ::oBmp != NIL
          ::oBmp:ScrollToPagePoint( nPage, 0, 0 )
          ::oBmp:Refresh()
@@ -2073,6 +2070,7 @@ METHOD GoToPage( nPage ) CLASS TPdfViewer
    endif
 
    ::nCurPage      := nPage
+   ::NotifyPageChange()
    ::nPageWidthPt  := 0            // pagina nueva: invalidar el cache de tamanio en puntos (cada pagina puede tener un MediaBox distinto)
    ::nPageHeightPt := 0
 
@@ -2158,20 +2156,24 @@ METHOD ZoomOut() CLASS TPdfViewer
 return ::BuildComposite()
 
 //----------------------------------------------------------------------------//
-// Rotar (Arturo: "necesito un proceso de rotar pagina 90 grados") -- suma
-// 90 grados (mod 360) a ::nUserRotate, invalida el cache de tamanio en
-// puntos (::nPageWidthPt/HeightPt, igual que GoToPage() -- rotar 90/270
-// intercambia ancho/alto, asi que el valor viejo quedaria mal) y vuelve
-// a renderizar. Afecta pantalla Y PrintDocument() por igual (mismo
-// ::nUserRotate, mismo Pdf_RenderToHBitmap) -- si el usuario endereza la
-// vista, tiene sentido que lo impreso tambien salga derecho.
+// Rotar -- suma 'nDegrees' (DEFAULT 90, /Rotate es en sentido horario;
+// pasar -90 rota a la izquierda) a ::nUserRotate (mod 360, sumando 360
+// antes para que Harbour no devuelva un resto negativo con nDegrees<0),
+// invalida el cache de tamanio en puntos (::nPageWidthPt/HeightPt, igual
+// que GoToPage() -- rotar 90/270 intercambia ancho/alto, asi que el
+// valor viejo quedaria mal) y vuelve a renderizar. Afecta pantalla Y
+// PrintDocument() por igual (mismo ::nUserRotate, mismo
+// Pdf_RenderToHBitmap) -- si el usuario endereza la vista, tiene sentido
+// que lo impreso tambien salga derecho.
 //----------------------------------------------------------------------------//
 
-METHOD RotatePage() CLASS TPdfViewer
+METHOD RotatePage( nDegrees ) CLASS TPdfViewer
+
+   DEFAULT nDegrees := 90
 
    if ::oBmp != NIL ; ::oBmp:ClearFormEdit() ; endif
 
-   ::nUserRotate   := ( ::nUserRotate + 90 ) % 360
+   ::nUserRotate   := ( ::nUserRotate + nDegrees + 360 ) % 360
    ::nPageWidthPt  := 0
    ::nPageHeightPt := 0
 
@@ -2696,39 +2698,98 @@ return { ::nPageWidthPt, ::nPageHeightPt }
 
 //----------------------------------------------------------------------------//
 // Busqueda (Etapa 5 del roadmap de potencialidad MuPDF, ver DESIGN.md
-// seccion 70) -- Find() arranca desde la pagina actual, FindNext() avanza
-// (dentro de la pagina si quedan mas matches cacheados, si no a la
-// siguiente pagina que tenga alguno) con wrap al llegar al final. El PDF
-// completo se recorre pagina por pagina via Pdf_FindText (que ya usa el
-// cache de 4 slots de pdf_hbfunc.c -- reabrir la busqueda sobre paginas ya
-// visitadas no vuelve a correr el content stream).
+// seccion 70) -- SearchNext()/SearchPrev() son el punto de entrada de la
+// UI (pdf_demo.prg, botones "Anterior"/"Siguiente" -- no hace falta un
+// boton "Buscar" aparte, arman la busqueda solos si el texto cambio).
+// FindNext()/FindPrev() avanzan/retroceden (dentro de la pagina si quedan
+// mas matches cacheados, si no a la proxima/anterior pagina que tenga
+// alguno) con wrap al llegar a una punta. El PDF completo se recorre
+// pagina por pagina via Pdf_FindText (que ya usa el cache de 4 slots de
+// pdf_hbfunc.c -- reabrir la busqueda sobre paginas ya visitadas no
+// vuelve a correr el content stream).
 //----------------------------------------------------------------------------//
 
 METHOD Find( cNeedle, lCaseSensitive ) CLASS TPdfViewer
 
    DEFAULT lCaseSensitive := .F.
 
+   if ::pDoc == NIL .or. Empty( cNeedle )
+      ::ClearFind()
+      return .F.
+   endif
+
+   ::ArmFind( cNeedle, lCaseSensitive )
+
+return ::FindNext()
+
+//----------------------------------------------------------------------------//
+// Resetea el estado de busqueda para arrancar una nueva (sin buscar
+// todavia -- eso lo hace el FindNext()/FindPrev() que sigue). Factorizado
+// de Find() para que SearchNext()/SearchPrev() (mas abajo) puedan armar
+// solos cuando hace falta, sin pasar por Find().
+//----------------------------------------------------------------------------//
+
+METHOD ArmFind( cNeedle, lCaseSensitive ) CLASS TPdfViewer
+
+   DEFAULT lCaseSensitive := .F.
+
    // BUG REAL ENCONTRADO (Arturo: arrastre de seleccion entre paginas
    // "queda pegado" en pantalla al usar Buscar despues) -- ::ClearSelection()
    // solo se disparaba desde LButtonDown (un click NUEVO sobre la
-   // pagina) -- clickear el campo de busqueda o el boton "Buscar" no
+   // pagina) -- clickear el campo de busqueda o un boton de busqueda no
    // toca el control del bitmap para nada, asi que la seleccion vieja
    // se quedaba dibujada por Paint() indefinidamente. Una busqueda
    // nueva reemplaza logicamente cualquier seleccion vigente.
    ::ClearSelection()
+
+   ::cFindNeedle         := cNeedle
+   ::lFindCaseSensitive  := lCaseSensitive
+   ::nFindPage           := ::nCurPage     // FindNext()/FindPrev() arrancan buscando EN esta pagina primero
+   ::aFindMatches        := {}
+   ::nFindMatchIdx       := 0
+
+return NIL
+
+//----------------------------------------------------------------------------//
+// Punto de entrada pensado para la UI (ver pdf_demo.prg, botones
+// "Anterior"/"Siguiente") -- ya no hace falta un boton "Buscar" aparte:
+// si el texto cambio (o no habia ninguna busqueda activa), arma una
+// nueva sola antes de avanzar/retroceder. Con el MISMO texto que la
+// busqueda ya activa, simplemente sigue avanzando/retrocediendo sobre
+// los matches ya encontrados.
+//----------------------------------------------------------------------------//
+
+METHOD SearchNext( cNeedle, lCaseSensitive ) CLASS TPdfViewer
+
+   DEFAULT lCaseSensitive := .F.
 
    if ::pDoc == NIL .or. Empty( cNeedle )
       ::ClearFind()
       return .F.
    endif
 
-   ::cFindNeedle         := cNeedle
-   ::lFindCaseSensitive  := lCaseSensitive
-   ::nFindPage           := ::nCurPage     // FindNext() arranca buscando EN esta pagina primero
-   ::aFindMatches         := {}
-   ::nFindMatchIdx        := 0
+   if ::cFindNeedle == NIL .or. !( ::cFindNeedle == cNeedle ) .or. ::lFindCaseSensitive != lCaseSensitive
+      ::ArmFind( cNeedle, lCaseSensitive )
+   endif
 
 return ::FindNext()
+
+//----------------------------------------------------------------------------//
+
+METHOD SearchPrev( cNeedle, lCaseSensitive ) CLASS TPdfViewer
+
+   DEFAULT lCaseSensitive := .F.
+
+   if ::pDoc == NIL .or. Empty( cNeedle )
+      ::ClearFind()
+      return .F.
+   endif
+
+   if ::cFindNeedle == NIL .or. !( ::cFindNeedle == cNeedle ) .or. ::lFindCaseSensitive != lCaseSensitive
+      ::ArmFind( cNeedle, lCaseSensitive )
+   endif
+
+return ::FindPrev()
 
 //----------------------------------------------------------------------------//
 
@@ -2783,6 +2844,64 @@ METHOD FindNext() CLASS TPdfViewer
       nPage++
       if nPage > ::nPageCount
          nPage := 1
+      endif
+   next
+
+   ::aFindMatches  := {}
+   ::nFindMatchIdx := 0
+   if ::oBmp != NIL
+      ::oBmp:aHighlight := {}
+      ::oBmp:Refresh()
+   endif
+
+return .F.
+
+//----------------------------------------------------------------------------//
+// Espejo de FindNext() pero retrocediendo -- misma logica de "pagina
+// agotada" (::nFindMatchIdx == 1 quiere decir que ya se mostro el PRIMER
+// match de ::nFindPage, asi que retroceder significa pasar a la pagina
+// ANTERIOR) y de wrap (nPageCount intentos como mucho, dando la vuelta
+// por el principio del documento). Al caer en una pagina nueva se para
+// en su ULTIMO match (no el primero) -- llegando "desde atras", es el
+// mas cercano.
+//----------------------------------------------------------------------------//
+
+METHOD FindPrev() CLASS TPdfViewer
+
+   local nPage, nTries
+
+   if ::pDoc == NIL .or. Empty( ::cFindNeedle )
+      return .F.
+   endif
+
+   // si todavia hay matches cacheados de esta pagina por delante del
+   // actual, retroceder ahi dentro antes de cambiar de pagina.
+   if ::nFindMatchIdx > 1
+      ::nFindMatchIdx--
+      return ::ShowCurrentFindMatch()
+   endif
+
+   if ::nFindMatchIdx == 1
+      nPage := ::nFindPage - 1
+      if nPage < 1
+         nPage := ::nPageCount
+      endif
+   else
+      nPage := if( ::nFindPage >= 1, ::nFindPage, ::nCurPage )
+   endif
+
+   for nTries := 1 to ::nPageCount
+      ::aFindMatches := Pdf_FindText( ::pDoc, nPage, ::cFindNeedle, ::lFindCaseSensitive )
+
+      if Len( ::aFindMatches ) > 0
+         ::nFindPage     := nPage
+         ::nFindMatchIdx := Len( ::aFindMatches )
+         return ::ShowCurrentFindMatch()
+      endif
+
+      nPage--
+      if nPage < 1
+         nPage := ::nPageCount
       endif
    next
 

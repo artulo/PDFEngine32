@@ -9,17 +9,26 @@
 void pdf_path_reset(pdf_path *path)
 {
     if (path == NULL) return;
-    path->n_points    = 0;
-    path->n_subpaths  = 0;
-    path->has_current = 0;
+    path->n_points        = 0;
+    path->n_subpaths      = 0;
+    path->has_current     = 0;
+    path->subpath_overflow = 0;
 }
 
 static void pdf_path_begin_subpath(pdf_path *path, double x, double y)
 {
-    if (path->n_subpaths >= PDF_PATH_MAX_SUBPATHS)
-        return; /* capacidad agotada: se descarta silenciosamente */
-    if (path->n_points >= PDF_PATH_MAX_POINTS)
+    if (path->n_subpaths >= PDF_PATH_MAX_SUBPATHS ||
+        path->n_points   >= PDF_PATH_MAX_POINTS)
+    {
+        /* capacidad agotada: este 'm' se descarta silenciosamente --
+         * ver BUG REAL en pdf_path.h (PDF_PATH_MAX_SUBPATHS). Queda
+         * marcado para que pdf_path_add_point() descarte TAMBIEN los
+         * 'l'/'c'/'v'/'y' que le siguen, en vez de colgarlos por error
+         * del ultimo subpath valido. */
+        path->subpath_overflow = 1;
         return;
+    }
+    path->subpath_overflow = 0;
 
     path->subpath_start[path->n_subpaths]  = path->n_points;
     path->subpath_len[path->n_subpaths]    = 0;
@@ -38,6 +47,8 @@ static void pdf_path_begin_subpath(pdf_path *path, double x, double y)
 
 static void pdf_path_add_point(pdf_path *path, double x, double y)
 {
+    if (path->subpath_overflow)
+        return; /* el 'm' de este subpath ya se descarto por cupo -- ver arriba */
     if (path->n_subpaths == 0)
     {
         /* 'l'/'c' sin un 'm' previo: tratar como moveto implicito (PDF

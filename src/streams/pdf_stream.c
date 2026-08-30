@@ -6,16 +6,6 @@
 #include "pdf_stream.h"
 #include <string.h>
 
-/* BUG REAL ENCONTRADO (transparencia/shadings, fase 1 -- misma familia
- * que los bugs ya documentados en pdf_object.c/pdf_xref.c/pdf_filter.c/
- * pdf_page.c): este archivo es el candidato mas caliente de todos --
- * pdf_stream_seek/pdf_stream_refill se llaman en CADA seek/lectura de
- * CUALQUIER PDF, y ambos escriben 'buf_start'/'buf_len'/'buf_pos' en
- * secuencia directa, el patron exacto que dispara la miscompilacion de
- * bcc32 7.70. Es plausible que esta sea la causa raiz detras de varios
- * sintomas de corrupcion "aguas abajo" que parecian arreglados a medias
- * al tocar otras funciones. Mismo fix en todo el archivo: memcpy() desde
- * variables locales en vez de asignacion directa a campos adyacentes. */
 static void st_set_buf_window(pdf_stream *st, long start, int len, int pos)
 {
     memcpy(&st->buf_start, &start, sizeof(start));

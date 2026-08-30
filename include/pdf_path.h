@@ -11,7 +11,22 @@
  * Si un path real excede esto, los puntos/subpaths de mas se descartan
  * silenciosamente (documentado, no crashea) -- suficiente para planos
  * tipicos; si hace falta mas, subir las constantes es trivial.
- */
+ *
+ * BUG REAL ENCONTRADO (Arturo: "se introducen lineas que no
+ * corresponden" en D-6025IC1r0.pdf, un P&ID de AutoCAD) --
+ * PDF_PATH_MAX_SUBPATHS estaba en 256, muy por debajo de lo que un
+ * plano CAD real necesita (confirmado: un solo path de este archivo,
+ * antes de su 'S', hace 361 'm' -- "texto de una sola linea" estilo
+ * AutoCAD dibuja cada letra como su propio subpath chico, y un plano
+ * con muchas etiquetas los acumula rapido). Subido a 2048 -- ver
+ * ademas el fix en pdf_path.c (subpath_overflow) para el caso
+ * residual en que incluso esto no alcance: sin ese fix, un 'm' que no
+ * entra por el cupo no arrancaba nada, pero el 'l' que le seguia SI
+ * se agregaba -- al subpath ANTERIOR valido, prolongandolo con un
+ * punto que no le pertenece. El rasterizador dibuja cada subpath como
+ * una polilinea continua, asi que ese punto huerfano aparecia como
+ * una linea larga conectando dos partes del dibujo sin ninguna
+ * relacion real entre si. */
 
 #ifndef PDF_PATH_H
 #define PDF_PATH_H
@@ -21,7 +36,7 @@ extern "C" {
 #endif
 
 #define PDF_PATH_MAX_POINTS    8192
-#define PDF_PATH_MAX_SUBPATHS  256
+#define PDF_PATH_MAX_SUBPATHS  2048
 #define PDF_BEZIER_SEGMENTS    12
 
 typedef struct pdf_path_point_s
@@ -44,6 +59,13 @@ typedef struct pdf_path_s
     double cur_x, cur_y;
     double start_x, start_y;
     int    has_current;
+
+    /* .T. si el ULTIMO 'm' se descarto por cupo agotado (ver comentario
+     * grande de PDF_PATH_MAX_SUBPATHS arriba) -- mientras esta en .T.,
+     * cualquier 'l'/'c'/'v'/'y' que siga se descarta TAMBIEN (en vez de
+     * agregarse por error al subpath valido anterior), hasta el proximo
+     * 'm' que si entre por cupo. */
+    int    subpath_overflow;
 } pdf_path;
 
 void pdf_path_reset(pdf_path *path);

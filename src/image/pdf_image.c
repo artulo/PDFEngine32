@@ -162,7 +162,7 @@ static unsigned char *pdf_image_load_smask(pdf_stream *st, const pdf_xref_table 
     used_fast = pdf_image_smask_fast_gray8(st, xref, smask_dict, arena, &fast_w, &fast_h, &fast_gray);
     if (!used_fast)
     {
-        if (pdf_image_decode(st, xref, smask_dict, arena, &smask_img) != PDF_OK)
+        if (pdf_image_decode(st, xref, smask_dict, arena, &smask_img, 0.0, 0.0) != PDF_OK)
             return NULL;
         if (smask_img.rgb == NULL)
             return NULL;
@@ -241,7 +241,8 @@ static unsigned char *pdf_image_load_smask(pdf_stream *st, const pdf_xref_table 
 }
 
 int pdf_image_decode(pdf_stream *st, const pdf_xref_table *xref,
-                      pdf_obj *img_dict, pdf_arena *arena, pdf_image *out)
+                      pdf_obj *img_dict, pdf_arena *arena, pdf_image *out,
+                      double dest_w_px, double dest_h_px)
 {
     int width, height, bpc;
     int is_mask;
@@ -258,6 +259,7 @@ int pdf_image_decode(pdf_stream *st, const pdf_xref_table *xref,
     long row_bytes;
     int x, y;
     int decode_inverted; /* /Decode [1 0] en vez del default [0 1] -- ver comentario mas abajo */
+    int jpeg_reduction_hint; /* ver DESIGN.md seccion 87 -- solo se usa en el camino DCTDecode */
 
     if (out == NULL) return PDF_ERR_BADARG;
     memset(out, 0, sizeof(*out));
@@ -284,6 +286,26 @@ int pdf_image_decode(pdf_stream *st, const pdf_xref_table *xref,
     bpc    = (int)pdf_dict_get_int(img_dict, "BitsPerComponent", 8);
     if (width <= 0 || height <= 0 || width > 20000 || height > 20000)
         return PDF_ERR_BADARG; /* limites defensivos contra streams corruptos */
+
+    /* BUG REAL DE RENDIMIENTO (ver DESIGN.md seccion 87): decidir aca,
+     * UNA vez por decode, si conviene pedirle a DCTDecode una
+     * resolucion reducida -- solo tiene sentido cuando el llamador
+     * conoce el tamanio de destino (dest_w_px/dest_h_px > 0, ver
+     * pdf_image.h) Y la imagen se va a mostrar a la mitad o menos de
+     * su tamanio nativo en AMBOS ejes (el eje que MENOS se reduce
+     * manda -- si solo un eje se achica mucho pero el otro no, no es
+     * seguro perder resolucion). Umbral 2.0 exacto: "mitad o menos". */
+    {
+        jpeg_reduction_hint = 1;
+        if (dest_w_px > 0.0 && dest_h_px > 0.0)
+        {
+            double rx = (double)width  / dest_w_px;
+            double ry = (double)height / dest_h_px;
+            double rmin = (rx < ry) ? rx : ry;
+            if (rmin >= 2.0)
+                jpeg_reduction_hint = 2;
+        }
+    }
 
     {
         pdf_obj *im = pdf_dict_get(img_dict, "ImageMask");
@@ -505,7 +527,7 @@ int pdf_image_decode(pdf_stream *st, const pdf_xref_table *xref,
     if (filter_name != NULL && strcmp(filter_name, "DCTDecode") == 0)
     {
         pdf_jpeg_image jpg;
-        int drc = pdf_filter_dct(arena, raw, raw_len, &jpg);
+        int drc = pdf_filter_dct(arena, raw, raw_len, &jpg, jpeg_reduction_hint);
         if (drc != PDF_OK)
             return drc; /* propagar el motivo real (p.ej. PDF_ERR_NOMEM si
                          * la imagen no entra en el presupuesto del
@@ -832,11 +854,23 @@ void pdf_image_draw(pdf_bitmap *bmp, const pdf_image *img,
     if (box_w > 32) box_w = 32; /* limite defensivo: evitar costo excesivo en reducciones extremas */
     if (box_h > 32) box_h = 32;
 
+    /* BUG REAL DE RENDIMIENTO (Arturo: "mejorar la velocidad ... con
+     * demasiados graficos", medido contra 3240-3241-2.pdf -- una
+     * pagina escaneada de pagina completa): 'mat_transform' hacia una
+     * multiplicacion de matriz 2x3 COMPLETA por cada pixel de destino
+     * (hasta 2.5 millones de veces para esta imagen) para convertir
+     * (x,y) a espacio de imagen -- pero 'inv' es FIJA para todo el
+     * dibujo, asi que uv(x,y) es LINEAL en x a lo largo de una fila:
+     * uv.x avanza 'inv.a' y uv.y avanza 'inv.b' por cada pixel hacia
+     * la derecha (misma idea que un DDA de rasterizacion de texturas).
+     * Se arma el punto de partida de la fila UNA vez (con
+     * mat_transform, seguro) y de ahi en mas se suma en vez de
+     * multiplicar. */
     for (y = y0; y < y1; y++)
     {
-        for (x = x0; x < x1; x++)
+        pdf_point uv = mat_transform(inv, x0 + 0.5, y + 0.5);
+        for (x = x0; x < x1; x++, uv.x += inv.a, uv.y += inv.b)
         {
-            pdf_point uv = mat_transform(inv, x + 0.5, y + 0.5);
             int sx, sy;
 
             if (uv.x < 0.0 || uv.x >= 1.0 || uv.y < 0.0 || uv.y >= 1.0)
@@ -860,12 +894,23 @@ void pdf_image_draw(pdf_bitmap *bmp, const pdf_image *img,
                 else
                 {
                     const unsigned char *px = img->rgb + ((long)sy * img->width + sx) * 3;
-                    pdf_color c;
-                    c.r = px[0] / 255.0; c.g = px[1] / 255.0; c.b = px[2] / 255.0;
                     if (img->alpha != NULL)
+                    {
+                        pdf_color c;
+                        c.r = px[0] / 255.0; c.g = px[1] / 255.0; c.b = px[2] / 255.0;
                         pdf_image_blend_pixel(bmp, x, y, c, img->alpha[(long)sy * img->width + sx]);
+                    }
                     else
-                        pdf_bitmap_set_pixel(bmp, x, y, c);
+                    {
+                        /* BUG REAL DE RENDIMIENTO (ver comentario grande de
+                         * pdf_bitmap_set_pixel_rgb_u8 en pdf_bitmap.h/.c):
+                         * el caso SIN canal alfa propio (la inmensa mayoria
+                         * de imagenes DCTDecode -- fotos escaneadas,
+                         * fondos) no necesita el viaje byte->double->byte
+                         * de pdf_bitmap_set_pixel; se pasan los bytes tal
+                         * cual. */
+                        pdf_bitmap_set_pixel_rgb_u8(bmp, x, y, px[0], px[1], px[2]);
+                    }
                 }
             }
             else if (img->is_mask)
@@ -897,7 +942,7 @@ void pdf_image_draw(pdf_bitmap *bmp, const pdf_image *img,
                 int sx0 = sx - box_w / 2, sy0 = sy - box_h / 2;
                 int bx, by, count = 0;
                 long sum_r = 0, sum_g = 0, sum_b = 0;
-                pdf_color c;
+                unsigned char fr, fg, fb;
 
                 for (by = 0; by < box_h; by++)
                 {
@@ -917,22 +962,26 @@ void pdf_image_draw(pdf_bitmap *bmp, const pdf_image *img,
                 if (count == 0)
                 {
                     const unsigned char *px = img->rgb + ((long)sy * img->width + sx) * 3;
-                    c.r = px[0] / 255.0; c.g = px[1] / 255.0; c.b = px[2] / 255.0;
+                    fr = px[0]; fg = px[1]; fb = px[2];
                 }
                 else
                 {
-                    c.r = (sum_r / count) / 255.0;
-                    c.g = (sum_g / count) / 255.0;
-                    c.b = (sum_b / count) / 255.0;
+                    fr = (unsigned char)(sum_r / count);
+                    fg = (unsigned char)(sum_g / count);
+                    fb = (unsigned char)(sum_b / count);
                 }
                 /* alpha: se muestrea un solo punto (sx,sy) en vez de
                  * promediar la misma caja -- simplificacion razonable,
                  * los canales alpha (sombras/mascaras suaves) casi
                  * siempre son de baja frecuencia, no deberia notarse. */
                 if (img->alpha != NULL)
+                {
+                    pdf_color c;
+                    c.r = fr / 255.0; c.g = fg / 255.0; c.b = fb / 255.0;
                     pdf_image_blend_pixel(bmp, x, y, c, img->alpha[(long)sy * img->width + sx]);
+                }
                 else
-                    pdf_bitmap_set_pixel(bmp, x, y, c);
+                    pdf_bitmap_set_pixel_rgb_u8(bmp, x, y, fr, fg, fb);
             }
         }
     }
