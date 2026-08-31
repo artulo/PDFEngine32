@@ -22,6 +22,12 @@ Z2 	  BITMAP "Z2.bmp"
 Z5	  BITMAP "Z5.bmp"
 Z6 	  BITMAP "Z6.bmp"
 Z7 	  BITMAP "Z7.bmp"
+Resaltar 	   BITMAP "ann_highlight.bmp" 
+Linea 	   BITMAP "ann_line.bmp"  
+Rectangulo 	   BITMAP "ann_rect.bmp"
+Circulo 	   BITMAP "ann_circle.bmp"
+Tinta 	   BITMAP "ann_ink.bmp"  
+Tip 	   BITMAP "ann_tip.bmp"
 FONDO BITMAP "databook.bmp"
  
 

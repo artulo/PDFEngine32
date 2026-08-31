@@ -128,30 +128,30 @@ function Main()
 
 	
 		DEFINE BUTTON OF oBar ;
-			PROMPT "Resaltar" ;
+			RESOURCE "Resaltar" ;
 			ACTION ( IIF( oPdf:HighlightSelection(), ( nPage:=oPdf:nCurPage, oPage:Refresh() ), ;
 			               MsgStop( "No se pudo resaltar (no hay texto seleccionado, o el documento esta encriptado).", ;
 			                        "PDFEngine32" ) ) )
 
 
 			DEFINE BUTTON OF oBar ;
-				 PROMPT "Linea" ;
+				 RESOURCE "Linea" ;
 				 ACTION ( oPdf:StartDrawMode( "LINE" ) )
 
 			DEFINE BUTTON OF oBar ;
-				 PROMPT "Rectangulo" ;
+				 RESOURCE "Rectangulo" ;
 				 ACTION ( oPdf:StartDrawMode( "RECT" ) )
 
 			DEFINE BUTTON OF oBar ;
-				 PROMPT "Circulo" ;
+				 RESOURCE "Circulo" ;
 				 ACTION ( oPdf:StartDrawMode( "CIRCLE" ) )
 
 			DEFINE BUTTON OF oBar ;
-				 PROMPT "Tinta" ;
+				 RESOURCE "Tinta" ;
 				 ACTION ( oPdf:StartDrawMode( "INK" ) )
 
 			DEFINE BUTTON OF oBar ;
-				 PROMPT "Tip" ;
+				 RESOURCE "Tip" ;
 				 ACTION ( oPdf:StartDrawMode( "TIP" ) )
 
 			DEFINE BUTTON OF oBar ;
@@ -169,9 +169,6 @@ function Main()
       ON RESIZE ( oPdf:Resize( nWidth, nHeight - ALTO_TOOLBAR ) ) ;
       VALID ( oPdf:Close(), .T. )
 	  
-	  /*
-	        ON INIT ( IIF( oPdf:Open( cPdf ) , oSayPage:Refresh(), ;
-                     MsgStop( "No se pudo abrir " + cPdf, "PDFEngine32" ) ) ) ;*/
 return nil
 //----------------------------------------------------------------------------//
 Static Function BuildMenu()
@@ -179,7 +176,7 @@ Static Function BuildMenu()
    Local oMenu
 
    MENU oMenu
-      MENUITEM "&Abrir" ACTION ( if(cargapdf(),( Npage:=1,nPageFin:=Opdf:NPageCount,Opage:refresh(),OpageFin:refresh(),obar:refresh() ),.f.) )
+      MENUITEM "&Abrir" ACTION ( cargapdf() )
       MENUITEM "&Salir" ACTION (ownd:End())
    ENDMENU
 
@@ -195,8 +192,8 @@ Function CargaPdf(nfile)
 	endif
 	if !File(cPdf)
 		Return .f.
-	else
-	//	oPdf:SetZoomFitHeight() 
+	endif
+	if !empty(oPdf)
 		oPdf:Close()
 	endif
 	oPdf:Open( cPdf )

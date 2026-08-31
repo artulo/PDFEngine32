@@ -119,6 +119,7 @@ REM de bcc32).
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\render\pdf_shading.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\filters\pdf_filter.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\filters\pdf_jpx.c
+%bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\filters\pdf_jbig2.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\interpreter\pdf_content.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\text\pdf_font.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\text\pdf_afm.c
@@ -135,6 +136,7 @@ REM de bcc32).
 
 if not exist pdf_render.obj goto ENGINEERROR
 if not exist pdf_jpx.obj goto ENGINEERROR
+if not exist pdf_jbig2.obj goto ENGINEERROR
 if not exist pdf_ttf.obj goto ENGINEERROR
 if not exist pdf_cff.obj goto ENGINEERROR
 if not exist pdf_text_extract.obj goto ENGINEERROR
@@ -226,6 +228,7 @@ echo pdf_function.obj + >> b32.bc
 echo pdf_shading.obj + >> b32.bc
 echo pdf_filter.obj + >> b32.bc
 echo pdf_jpx.obj + >> b32.bc
+echo pdf_jbig2.obj + >> b32.bc
 echo pdf_content.obj + >> b32.bc
 echo pdf_font.obj + >> b32.bc
 echo pdf_afm.obj + >> b32.bc

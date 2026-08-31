@@ -7,6 +7,7 @@
 #include "pdf_parser.h"
 #include "pdf_filter.h"
 #include "pdf_jpx.h"
+#include "pdf_jbig2.h"
 #include <string.h>
 #include <math.h>
 
@@ -582,6 +583,55 @@ int pdf_image_decode(pdf_stream *st, const pdf_xref_table *xref,
         ncomp = 1;
         row_bytes = (columns + 7) / 8;
         width = columns; /* por si difiere levemente del /Width declarado */
+    }
+    /* --- JBIG2Decode (ver DESIGN.md secciones 91-92): mismo patron que
+     * CCITTFaxDecode arriba -- produce bits empaquetados 1bpp que el
+     * desempaquetado generico de mas abajo lee igual que cualquier
+     * imagen cruda de 1 bpc (pdf_filter_jbig2 ya normaliza la
+     * convencion de polaridad, ver ese archivo). El unico parametro
+     * real es /JBIG2Globals (un stream compartido de segmentos,
+     * tipicamente diccionarios de simbolos reusados entre paginas --
+     * esta implementacion no soporta diccionarios de simbolos, pero
+     * igual hay que pasarlo: podria traer legitimamente un segmento de
+     * informacion de pagina u otro dato que si hace falta). */
+    else if (filter_name != NULL && strcmp(filter_name, "JBIG2Decode") == 0)
+    {
+        pdf_obj *parms = pdf_dict_get(img_dict, "DecodeParms");
+        const unsigned char *globals = NULL;
+        long globals_len = 0;
+        pdf_buf dec;
+
+        if (parms == NULL) parms = pdf_dict_get(img_dict, "DP");
+        if (parms != NULL && parms->type == PDF_REF)
+            parms = pdf_parser_load_object(st, xref, parms->u.ref.num, arena);
+        if (parms != NULL && parms->type == PDF_DICT)
+        {
+            pdf_obj *g = pdf_dict_get(parms, "JBIG2Globals");
+            if (g != NULL && g->type == PDF_REF)
+                g = pdf_parser_load_object(st, xref, g->u.ref.num, arena);
+            if (g != NULL && g->type == PDF_STREAM)
+            {
+                unsigned char *gbuf = (unsigned char *)pdf_arena_alloc(arena, (size_t)g->u.stm.raw_length);
+                long glen;
+                if (gbuf != NULL)
+                {
+                    pdf_stream_seek(st, g->u.stm.raw_offset);
+                    glen = pdf_stream_read(st, gbuf, g->u.stm.raw_length);
+                    if (xref != NULL && xref->crypt.active)
+                        glen = pdf_crypt_decrypt(&xref->crypt, g->u.stm.obj_num, g->u.stm.obj_gen, gbuf, glen);
+                    globals = gbuf;
+                    globals_len = glen;
+                }
+            }
+        }
+
+        if (pdf_filter_jbig2(arena, raw, raw_len, globals, globals_len, width, height, &dec) != PDF_OK)
+            return PDF_ERR_UNSUPPORTED;
+
+        sample_bytes = dec.data;
+        bpc = 1;
+        ncomp = 1;
+        row_bytes = (width + 7) / 8;
     }
     else if (filter_name != NULL && strcmp(filter_name, "FlateDecode") == 0)
     {
